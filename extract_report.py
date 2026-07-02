@@ -9,13 +9,6 @@ Usage:
 Requires:
     pip install anthropic --break-system-packages
     ANTHROPIC_API_KEY environment variable already set (setx, done in CMD)
-
-This is the automated version of the extraction Claude did by hand, in-chat,
-for Mystic Blue / Silver Falls / Ruah / Vukukhanya / JKW earlier in this project.
-Same schema, same honesty rule: fields not present in the source document come
-back as null, never guessed. The LLM only extracts what's on the page — it does
-not compute the rating itself. Scoring happens afterward in telematix_scoring.py,
-using only real numbers.
 """
 
 import sys
@@ -49,8 +42,12 @@ clearly readable from a labelled data table. If a value is only visible on a gra
 an accompanying number, set it to null and note it in "low_confidence_fields" rather than \
 guessing a pixel position.
 
+CRITICAL: Never place a raw incident count into a "_score" field, or vice versa. If a report \
+page only shows a 0-100 risk score with no exact number (unlabelled graph), the "_score" field \
+is null. If a page separately shows a raw count table, populate the matching \
+"_incident_count" field instead. These are never interchangeable.
+
 Return ONLY valid JSON (no markdown fences, no prose before or after) in this exact shape:
-CRITICAL: Never place a raw incident count into a "_score" field, or vice versa. If a report page only shows a 0-100 risk score with no exact number (unlabelled graph), the "_score" field is null. If a page separately shows a raw count table, populate the matching "_incident_count" field instead. These are never interchangeable.
 
 {
   "document_type": "RMS_REPORT" or "POLICY_SCHEDULE",
@@ -151,9 +148,12 @@ def extract_pdf(pdf_path: str) -> dict:
 
 
 def build_fleet_record(extracted: dict) -> FleetRecord:
-    """Converts extracted JSON into a FleetRecord and scores it. Only uses
-    fields the extraction actually found — no guessing at this stage either."""
+    """Converts extracted JSON into a FleetRecord. Falls back to the fleet-level
+    summary's combined score for the most recent month if the monthly table
+    itself didn't have an exact reported figure (common when RMS's own graph
+    is unlabelled but the intro paragraph still states the current score)."""
     name = extracted.get("transporter_or_insured_name", "Unknown Fleet")
+    fs = extracted.get("fleet_summary", {})
     months = []
 
     if extracted.get("monthly_data"):
@@ -167,13 +167,14 @@ def build_fleet_record(extracted: dict) -> FleetRecord:
                 distance_index=m.get("distance_index"),
                 concealment_events=m.get("device_covered_count"),
                 combined_score_reported=m.get("combined_score_reported"),
-                km_per_vehicle_month=extracted["fleet_summary"].get("avg_km_per_vehicle_month"),
+                km_per_vehicle_month=fs.get("avg_km_per_vehicle_month"),
             ))
+        # If the last month in the table has no exact combined score, but the
+        # document's summary paragraph states one (e.g. "combined risk score
+        # of 73/100"), use that as the latest point rather than discarding it.
+        if months and months[-1].combined_score_reported is None:
+            months[-1].combined_score_reported = fs.get("combined_risk_score_latest")
     else:
-        # Fleet-summary-only document (no monthly breakdown extracted) —
-        # score on the single latest figure so the engine still runs, but
-        # trend/recovery logic won't have enough history to activate.
-        fs = extracted.get("fleet_summary", {})
         months.append(MonthlyBehaviouralInputs(
             combined_score_reported=fs.get("combined_risk_score_latest"),
             km_per_vehicle_month=fs.get("avg_km_per_vehicle_month"),
