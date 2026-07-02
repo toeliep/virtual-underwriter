@@ -13,17 +13,14 @@ rules agreed with Frans Prinsloo (July 2026) that the original workbook did not 
 
 This module intentionally does NOT call an LLM anywhere. Every number here is a
 literal port of Frans's formulas or an explicit rule he confirmed. Per the Virtual
-Underwriter's design principle (Slide 4 / Slide 12 of the deck): the LLM explains
-and flags, it never computes a rating number itself.
+Underwriter's design principle: the LLM explains and flags, it never computes a
+rating number itself.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ---- Section B weights, as per Rating Input sheet (weights sum to 0.9, not 1.0 —
-# preserved exactly as Frans built it; not "fixed" to sum to 1, since that was not
-# flagged as a bug and changing it would silently re-rate every fleet in the book) ----
 WEIGHTS = {
     "fatigue_hos": 0.20,
     "speeding": 0.15,
@@ -47,9 +44,6 @@ TREND_MODIFIERS = {
 
 @dataclass
 class MonthlyBehaviouralInputs:
-    """One month's worth of Section B inputs. Any field left None is treated as
-    NOT SUPPLIED, not zero — the engine will flag it rather than silently score
-    on incomplete data (per the Mystic Blue / Silver Falls extraction gap)."""
     fatigue_hos: Optional[float] = None
     speeding: Optional[float] = None
     cellphone_talking: Optional[float] = None
@@ -62,30 +56,27 @@ class MonthlyBehaviouralInputs:
     night_driving_ratio: Optional[float] = None
     concealment_events: Optional[int] = None
     km_per_vehicle_month: Optional[float] = None
-    combined_score_reported: Optional[float] = None  # RMS's own figure, for cross-check only
+    combined_score_reported: Optional[float] = None
 
 
 @dataclass
 class FleetRecord:
     name: str
-    static_risk_score: Optional[float] = None  # from separate transporter questionnaire
-    static_risk_complete: bool = True  # 10-point loading if incomplete, per Instructions sheet
-    months: list = field(default_factory=list)  # chronological list of MonthlyBehaviouralInputs
-    prior_breach_month_index: Optional[int] = None  # month index (0-based) where a hard trigger last fired
-    intervention_documented: bool = False  # driver retraining + speed limiter verified
+    static_risk_score: Optional[float] = None
+    static_risk_complete: bool = True
+    months: list = field(default_factory=list)
+    prior_breach_month_index: Optional[int] = None
+    intervention_documented: bool = False
     months_since_last_annual_review: int = 0
 
 
 def cellphone_usage_score(m: MonthlyBehaviouralInputs) -> Optional[float]:
-    """Locked rule (Toelie, this thread): average(talking, texting)."""
     if m.cellphone_talking is None or m.cellphone_texting is None:
         return None
     return (m.cellphone_talking + m.cellphone_texting) / 2
 
 
 def weighted_behavioural_score(m: MonthlyBehaviouralInputs) -> dict:
-    """Returns weighted score using ONLY the fields actually supplied, and flags
-    which fields were missing — mirrors the extraction gap found in real RMS reports."""
     values = {
         "fatigue_hos": m.fatigue_hos,
         "speeding": m.speeding,
@@ -102,15 +93,12 @@ def weighted_behavioural_score(m: MonthlyBehaviouralInputs) -> dict:
     if present_weight == 0:
         return {"score": None, "missing_fields": missing, "weight_used": 0.0}
     weighted_sum = sum(values[k] * WEIGHTS[k] for k in values if values[k] is not None)
-    # Score computed on the weight actually available, scaled back to the 0.9 base
-    # so a partial-field fleet isn't silently penalised or flattered vs. a full one.
     scaled_score = weighted_sum * (0.9 / present_weight) if present_weight else None
     return {"score": round(scaled_score, 2) if scaled_score is not None else None,
             "missing_fields": missing, "weight_used": round(present_weight, 2)}
 
 
 def check_auto_decline_triggers(m: MonthlyBehaviouralInputs, combined_score: Optional[float]) -> list:
-    """Section E — four hard triggers. Any one fires = unconditional decline."""
     triggers = []
     if combined_score is not None and combined_score > 100:
         triggers.append("Combined risk score > 100")
@@ -124,8 +112,6 @@ def check_auto_decline_triggers(m: MonthlyBehaviouralInputs, combined_score: Opt
 
 
 def check_rising_trend_referral(monthly_combined_scores: list, band_low=66, band_high=85) -> Optional[str]:
-    """New rule (Frans, confirmed this thread): Amber-band fleet rising 4+
-    consecutive months with no plateau -> refer, even with zero hard triggers."""
     if len(monthly_combined_scores) < 4:
         return None
     last4 = monthly_combined_scores[-4:]
@@ -139,21 +125,16 @@ def check_rising_trend_referral(monthly_combined_scores: list, band_low=66, band
 
 
 def check_recovery_status(fleet: FleetRecord, current_month_index: int) -> dict:
-    """Post-Breach Recovery Clause (Frans, confirmed this thread):
-    fleet stays OFF COVER until: 3 consecutive clean months AND documented
-    intervention AND the next scheduled annual review date. Recovery is not
-    immediate on hitting the 3-month bar."""
     if fleet.prior_breach_month_index is None:
         return {"status": "n/a", "note": "No prior breach on record"}
 
-    months_since_breach = current_month_index - fleet.prior_breach_month_index
     clean_months = 0
     for m in fleet.months[fleet.prior_breach_month_index + 1: current_month_index + 1]:
         triggers = check_auto_decline_triggers(m, m.combined_score_reported)
         if not triggers:
             clean_months += 1
         else:
-            clean_months = 0  # any renewed trigger resets the clean-month count
+            clean_months = 0
 
     conditions_met = (clean_months >= 3) and fleet.intervention_documented
     at_annual_review = fleet.months_since_last_annual_review == 0
@@ -170,9 +151,6 @@ def check_recovery_status(fleet: FleetRecord, current_month_index: int) -> dict:
 
 
 def score_fleet(fleet: FleetRecord) -> dict:
-    """Runs the full engine against a fleet's monthly history and returns a verdict
-    dict with full traceability — every figure ties back to its source input,
-    per the audit-trail promise in the deck."""
     if not fleet.months:
         return {"fleet": fleet.name, "verdict": "NO DATA", "detail": "No monthly records supplied"}
 
@@ -189,9 +167,6 @@ def score_fleet(fleet: FleetRecord) -> dict:
         if beh["score"] is not None:
             combined = beh["score"] + static_adj
 
-        # Use RMS's own reported combined score for trigger-checking where our
-        # own computed score is None due to missing fields — never silently
-        # substitute a guess for a real trigger check.
         trigger_basis = combined if combined is not None else m.combined_score_reported
         triggers = check_auto_decline_triggers(m, trigger_basis)
 
@@ -216,7 +191,9 @@ def score_fleet(fleet: FleetRecord) -> dict:
     latest = monthly_results[-1]
     verdict = {"fleet": fleet.name, "monthly_results": monthly_results}
 
-    if fleet.prior_breach_month_index is not None:
+    if latest["combined_score_used_for_triggers"] is None:
+        verdict["verdict"] = "INSUFFICIENT DATA — no usable combined score extracted, cannot verify"
+    elif fleet.prior_breach_month_index is not None:
         recovery = check_recovery_status(fleet, len(fleet.months) - 1)
         verdict["recovery_status"] = recovery
         verdict["verdict"] = recovery["status"]
