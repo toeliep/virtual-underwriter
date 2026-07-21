@@ -1,0 +1,2789 @@
+import React, { useState, useCallback, useRef } from "react";
+import MultiCohortView from "./MultiCohortView.jsx";
+
+// ---------------------------------------------------------------------------
+// Deterministic scoring engine — JS port of telematix_scoring.py.
+// Same rules, same honesty guarantee: never guesses a missing field, never
+// silently defaults "no data" to "accept". This is the audit-trail layer;
+// the LLM above it only extracts, it never computes a verdict.
+// ---------------------------------------------------------------------------
+
+function checkAutoDeclineTriggers(m) {
+  const triggers = [];
+  if (m.combined_score_used != null && m.combined_score_used > 100) {
+    triggers.push("Combined risk score exceeds 100");
+  }
+  if (m.km_per_vehicle_month != null && m.km_per_vehicle_month > 16000) {
+    triggers.push(
+      `km/vehicle/month ${Math.round(m.km_per_vehicle_month)} exceeds 16,000 (illegal HoS for single driver)`
+    );
+  }
+  if (m.device_covered_count != null && m.device_covered_count > 200) {
+    triggers.push(`Device concealment events ${m.device_covered_count}/mo exceeds 200`);
+  }
+  if (m.speeding != null && m.fatigue_hos != null && m.speeding > 60 && m.fatigue_hos > 80) {
+    triggers.push(`Speeding (${m.speeding}) AND Fatigue (${m.fatigue_hos}) both breach simultaneously`);
+  }
+  return triggers;
+}
+
+function checkRisingTrendReferral(scores, bandLow = 66, bandHigh = 85) {
+  const real = scores.filter((s) => s != null);
+  if (real.length < 4) return null;
+  const last4 = real.slice(-4);
+  const strictlyRising = last4.every((v, i) => i === 0 || v > last4[i - 1]);
+  const current = last4[last4.length - 1];
+  const inAmber = current >= bandLow && current <= bandHigh;
+  if (strictlyRising && inAmber) {
+    return `4-month rising trend (${last4[0].toFixed(0)} -> ${last4[3].toFixed(0)}) in Amber band, no plateau — refer for underwriting review per trend rule`;
+  }
+  return null;
+}
+
+function scoreFleet(extracted) {
+  const fs = extracted.fleet_summary || {};
+  let months = (extracted.monthly_data || []).map((m) => ({
+    ...m,
+    combined_score_used: m.combined_score_reported,
+    km_per_vehicle_month: fs.avg_km_per_vehicle_month,
+  }));
+
+  if (months.length === 0) {
+    months = [
+      {
+        combined_score_used: fs.combined_risk_score_latest,
+        km_per_vehicle_month: fs.avg_km_per_vehicle_month,
+      },
+    ];
+  } else if (months[months.length - 1].combined_score_used == null) {
+    months[months.length - 1].combined_score_used = fs.combined_risk_score_latest;
+  }
+
+  const monthlyResults = months.map((m) => ({
+    ...m,
+    triggers: checkAutoDeclineTriggers(m),
+  }));
+
+  const latest = monthlyResults[monthlyResults.length - 1];
+  const firstBreachIdx = monthlyResults.findIndex((m) => m.triggers.length > 0);
+
+  let verdict, detail;
+
+  if (latest.combined_score_used == null) {
+    verdict = "INSUFFICIENT DATA";
+    detail = "No usable combined score could be extracted from this document — cannot verify.";
+  } else if (firstBreachIdx !== -1) {
+    // Toelie-confirmed (9 July 2026): breach anywhere in this document's
+    // history -> DECLINE. "OFF COVER" was a dead-code branch that could
+    // never actually be reached (firstBreachIdx already caught the latest
+    // month's own breach before this point), and the business treats the
+    // two labels as meaning the same thing -- consolidated to DECLINE.
+    const cleanSince = monthlyResults.slice(firstBreachIdx + 1);
+    let cleanStreak = 0;
+    for (const m of cleanSince) {
+      if (m.triggers.length === 0) cleanStreak += 1;
+      else cleanStreak = 0;
+    }
+    verdict = "DECLINE";
+    detail =
+      cleanStreak > 0
+        ? `Breach on record (month ${firstBreachIdx + 1}); ${cleanStreak} clean month(s) since, but recovery requires 3+ clean months AND documented intervention AND next annual review — conditions not yet confirmed met.`
+        : `Breach on record (month ${firstBreachIdx + 1}), fleet has not yet recorded a clean month since.`;
+  } else {
+    const trend = checkRisingTrendReferral(monthlyResults.map((m) => m.combined_score_used));
+    if (trend) {
+      verdict = "REFER";
+      detail = trend;
+    } else {
+      verdict = "ACCEPT";
+      detail = "No auto-decline trigger fired, no adverse sustained trend detected.";
+    }
+  }
+
+  return { verdict, detail, latest, monthlyResults, firstBreachIdx };
+}
+
+// ---------------------------------------------------------------------------
+// GIT scoring engine — JS port of git_scoring.py. Same constants, same
+// mandatory-security gate. Hardcoded benchmark scenarios only for now;
+// a full input form comes later.
+// ---------------------------------------------------------------------------
+
+const GIT_BASE_ANNUAL_RATE = 0.00711;
+const GIT_BASE_MONTHLY_RATE = GIT_BASE_ANNUAL_RATE / 12;
+const GIT_ALL_RISKS_PERIL_BLEND = 2.0;
+
+const GIT_COMMODITY_FACTORS = {
+  coal_mining_bulk: 0.55,
+  agricultural_grain: 0.98,
+  general_cargo: 1.0,
+  building_materials: 1.1,
+  timber_paper: 1.15,
+  refrigerated_goods: 1.35,
+  machinery_equipment: 1.48,
+  automotive_parts: 1.65,
+  metals_steel_chrome: 2.16,
+  pharmaceuticals: 2.5,
+  alcohol_beverages: 2.83,
+  fuel_petroleum: 2.96,
+  electronics_tech: 3.2,
+  fmcg_retail_general: 5.0,
+  fmcg_branded_high_risk: 8.24,
+};
+
+// v2: Commodities appearing in Hollard's GIT General Exclusions (Section F) that TelematiX has
+// chosen to make available for referral rather than hard-excluding or auto-pricing. These are
+// NOT priced automatically - the correct security tier depends on the specific form/subtype
+// being transported (e.g. copper ore & aggregate vs refined copper require different minimum
+// locks), which requires case-by-case management research. No commodity factor is assigned.
+const GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL = new Set([
+  "antiques_artworks",
+  "ammunition_explosives_fireworks",
+  "bullion_cash_treasury_notes",
+  "cameras_cellphones_accessories",
+  "prepaid_phone_cards",
+  "computers_memory_systems",
+  "cobalt",
+  "copper_any_form",
+  "non_ferrous_metals",
+  "gold_silver_jewellery_watches_furs",
+  "documents_specie_stamps_tickets",
+  "bloodstock_game",
+  "tobacco_cigars_cigarettes",
+]);
+
+// v2: combined list for the dropdown - priced commodities plus excluded-but-selectable ones
+const GIT_ALL_COMMODITY_OPTIONS = [
+  ...Object.keys(GIT_COMMODITY_FACTORS),
+  ...GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL,
+].sort((a, b) => a.localeCompare(b));
+
+const GIT_GEOGRAPHIC_ZONE_LOADING = { western_cape: 1.0, medium_risk: 1.15, gauteng_high_risk: 1.3 };
+const GIT_CLAIMS_HISTORY_LOADING = { clean: 1.0, one_claim: 1.15 };
+const GIT_FLEET_AGE_LOADING = { new: 1.0, over_10yr: 1.15 };
+const GIT_NIGHT_OPS_LOADING = { under_30pct: 1.0, over_30pct: 1.2 };
+const GIT_CROSS_BORDER_LOADING = { local: 1.0, sadc: 1.25 };
+
+const GIT_IOT_CREDITS = {
+  gps_realtime_tracking: -0.15,
+  geofencing_alerting: -0.1,
+  driver_behaviour_monitoring: -0.12,
+  fatigue_drowsiness_sensor: -0.08,
+  cargo_seal_door_sensors: -0.1,
+  temperature_humidity_logger: -0.08,
+  load_weight_tilt_sensor: -0.1,
+  panic_button_armed_response: -0.05,
+  dashcam_front_rear: -0.05,
+};
+
+const GIT_NO_IOT_PENALTY = 0.2;
+const GIT_MAX_IOT_CREDIT = -0.4;
+const GIT_PROPOSED_CARGOSNAP_CREDIT = -0.08;
+const GIT_PROPOSED_CVTSCPI_RMP_CREDITS = {
+  none: 0.0,
+  rmp1_top_lock: -0.1,
+  rmp2_cable_lock: -0.15,
+  rmp3_tracktag: -0.2,
+};
+
+// v2: minimum premium floor (Hollard GIT minimum: R5,000 annual per policy)
+const GIT_MIN_ANNUAL_PREMIUM = 5000.0;
+
+// v2: regional referral thresholds on load_limit_per_vehicle (Hollard section 4.1 Referrals)
+const GIT_REFERRAL_LOAD_LIMIT_WESTERN_CAPE = 1500000; // Cape Town
+const GIT_REFERRAL_LOAD_LIMIT_OTHER_ZONES = 1000000; // JHB / KZN (gauteng_high_risk, medium_risk)
+
+// v2: loss ratio referral threshold (Hollard section 4.3 Referrals)
+const GIT_LOSS_RATIO_REFERRAL_THRESHOLD_PCT = 65.0;
+
+// v2: restricted cover tiers, expressed as a fraction of the All Risks premium
+const GIT_RESTRICTED_COVER_FACTORS = {
+  all_risks: 1.0,
+  fire_collision_overturning_theft_hijack: 0.8,
+  fire_collision_overturning_only: 0.75,
+};
+
+// Load-limit-band pricing (Hollard Trucking Underwriting Guide, Section
+// 5.1 -- Frans-confirmed 10 July 2026 as the market-standard system,
+// replacing the commodity-factor multiplicative formula). Each row is
+// [maxLoadLimit, premiumPerVehiclePerMonth]. A declared load limit
+// rounds UP to the next available tier (ASSUMPTION, not yet confirmed
+// with Frans -- flag if wrong). Above R1,500,000 there is no published
+// Hollard rate at all (their own table marks R1.75m/R2m as "Referral")
+// -- cannot be auto-priced even with a management override.
+const GIT_LOAD_LIMIT_MIN_RAND = 50000;
+const GIT_LOAD_LIMIT_MAX_PRICEABLE_RAND = 1500000;
+const GIT_LOAD_LIMIT_BAND_PVPM = [
+  [50000, 350.0],
+  [100000, 450.0],
+  [150000, 500.0],
+  [200000, 550.0],
+  [250000, 650.0],
+  [300000, 700.0],
+  [350000, 750.0],
+  [400000, 800.0],
+  [450000, 850.0],
+  [500000, 900.0],
+  [750000, 1150.0],
+  [1000000, 1450.0],
+  [1250000, 1700.0],
+  [1500000, 1950.0],
+];
+
+function gitLoadLimitBandPvpm(loadLimitPerVehicle) {
+  if (loadLimitPerVehicle < GIT_LOAD_LIMIT_MIN_RAND) {
+    return {
+      referral: true,
+      reason: `Load limit R${loadLimitPerVehicle.toLocaleString()} is below Hollard's R50,000 minimum priceable band -- refer to management.`,
+    };
+  }
+  for (const [maxLimit, pvpm] of GIT_LOAD_LIMIT_BAND_PVPM) {
+    if (loadLimitPerVehicle <= maxLimit) return { pvpm };
+  }
+  return {
+    referral: true,
+    reason: `Load limit R${loadLimitPerVehicle.toLocaleString()} exceeds R${GIT_LOAD_LIMIT_MAX_PRICEABLE_RAND.toLocaleString()} -- no published Hollard rate exists above this (their table marks R1.75m/R2m as Referral). Cannot be auto-priced even with an override; management must set a bespoke rate manually.`,
+  };
+}
+
+function makeGitFleetInput(overrides) {
+  return {
+    fleet_name: "",
+    vehicle_count: 0,
+    load_limit_per_vehicle: 0,
+    commodity_type: "general_cargo",
+    geographic_zone: "western_cape",
+    claims_history: "clean",
+    loss_ratio_pct: null, // v2: actual loss ratio %, if known. null = not yet available.
+    fleet_age: "new",
+    night_ops: "under_30pct",
+    cross_border: "local",
+    iot_devices_fitted: [],
+    cargosnap_fitted: false,
+    cvtscpi_rmp_tier: "none",
+    is_high_value_cargo: false,
+    is_rmp1_scoped: false,
+    cover_type: "all_risks", // v2: "all_risks" | "fire_collision_overturning_theft_hijack" | "fire_collision_overturning_only"
+    manual_commodity_factor: null, // v2: only used when overriding an excluded-commodity referral
+    ...overrides,
+  };
+}
+
+// Frans-confirmed (Decision Memo: RMP-1 Mandate for Loads Over R1m).
+// Eligibility-gate trigger ONLY -- does not change the rating formula.
+// Uses the declared/stated per-vehicle load limit (Q2), strictly per-load,
+// no aggregate exposure test (Q3).
+const GIT_RMP1_THRESHOLD_RAND = 1_000_000;
+
+function computeGitIotCreditStack(f) {
+  if (f.iot_devices_fitted.length === 0 && !f.cargosnap_fitted && f.cvtscpi_rmp_tier === "none") {
+    return { total_credit: GIT_NO_IOT_PENALTY, detail: "No IoT devices fitted" };
+  }
+  let total = 0.0;
+  const detail = [];
+  for (const device of f.iot_devices_fitted) {
+    if (device in GIT_IOT_CREDITS) {
+      total += GIT_IOT_CREDITS[device];
+      detail.push(`${device}: ${(GIT_IOT_CREDITS[device] * 100).toFixed(0)}%`);
+    }
+  }
+  if (f.cargosnap_fitted) {
+    total += GIT_PROPOSED_CARGOSNAP_CREDIT;
+    detail.push("cargosnap (proposed): -8%");
+  }
+  if (f.cvtscpi_rmp_tier !== "none") {
+    const credit = GIT_PROPOSED_CVTSCPI_RMP_CREDITS[f.cvtscpi_rmp_tier] ?? 0.0;
+    total += credit;
+    detail.push(`cvtscpi_${f.cvtscpi_rmp_tier}: ${(credit * 100).toFixed(0)}%`);
+  }
+  const capped = Math.max(total, GIT_MAX_IOT_CREDIT);
+  return { total_credit: capped, uncapped: total, detail, capped: capped !== total };
+}
+
+function checkGitMandatorySecurityRequirement(f) {
+  const inScope = f.is_high_value_cargo && f.is_rmp1_scoped;
+  if (!inScope) {
+    return {
+      in_scope: false,
+      mandatory_met: true,
+      note: "Fleet outside high-value/RMP-1 scope - no mandatory requirement applies",
+    };
+  }
+  const tiersOk = new Set(["rmp1_top_lock", "rmp2_cable_lock", "rmp3_tracktag"]);
+  const mandatoryMet = tiersOk.has(f.cvtscpi_rmp_tier);
+  return {
+    in_scope: true,
+    mandatory_met: mandatoryMet,
+    note: mandatoryMet ? "RMP 1 minimum satisfied" : "COVER CANNOT BIND - CV+TS+CPI RMP 1 (Top Lock) required",
+  };
+}
+
+// v2: Returns a list of reasons requiring referral to management, or an empty array if none.
+// Checks (in order): excluded commodity, regional load-limit threshold, loss ratio.
+function checkGitReferralTriggers(f) {
+  const reasons = [];
+
+  if (GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL.has(f.commodity_type)) {
+    reasons.push(
+      `Commodity '${f.commodity_type}' requires a case-by-case security assessment based on transport form/subtype - management approval required before quoting`
+    );
+  }
+
+  if (f.geographic_zone === "western_cape") {
+    if (f.load_limit_per_vehicle > GIT_REFERRAL_LOAD_LIMIT_WESTERN_CAPE) {
+      reasons.push(
+        `Load limit R${f.load_limit_per_vehicle.toLocaleString()} exceeds Cape Town referral threshold of R${GIT_REFERRAL_LOAD_LIMIT_WESTERN_CAPE.toLocaleString()}`
+      );
+    }
+  } else {
+    if (f.load_limit_per_vehicle > GIT_REFERRAL_LOAD_LIMIT_OTHER_ZONES) {
+      reasons.push(
+        `Load limit R${f.load_limit_per_vehicle.toLocaleString()} exceeds JHB/KZN referral threshold of R${GIT_REFERRAL_LOAD_LIMIT_OTHER_ZONES.toLocaleString()}`
+      );
+    }
+  }
+
+  if (f.loss_ratio_pct != null && f.loss_ratio_pct > GIT_LOSS_RATIO_REFERRAL_THRESHOLD_PCT) {
+    reasons.push(
+      `Loss ratio ${f.loss_ratio_pct.toFixed(1)}% exceeds referral threshold of ${GIT_LOSS_RATIO_REFERRAL_THRESHOLD_PCT.toFixed(0)}%`
+    );
+  }
+
+  return reasons;
+}
+
+// v2: override is optional {approverName, reason}. If provided, bypasses the REFER checks
+// (excluded commodity / regional load limit / loss ratio) and proceeds to premium calculation.
+// Does NOT bypass the mandatory CV+TS+CPI RMP1 security requirement, since that reflects
+// physical equipment fitted, not a judgment call. Every override is recorded in the result.
+function computeGitPvpm(f, override) {
+  const referralReasons = checkGitReferralTriggers(f);
+  if (referralReasons.length > 0 && !override) {
+    return {
+      fleet_name: f.fleet_name,
+      base_pvpm: null,
+      loaded_pvpm: null,
+      iot_credit: null,
+      final_pvpm: null,
+      vehicle_count: f.vehicle_count,
+      total_monthly_premium: null,
+      annual_premium: null,
+      mandatory_security: null,
+      referral_reasons: referralReasons,
+      override_applied: false,
+      verdict: "REFER",
+    };
+  }
+
+  // Commodity type still gates the referral check above (excluded
+  // commodities require management override to proceed at all) but no
+  // longer multiplies the price -- pricing is now load-limit-band based
+  // (Frans-confirmed 10 July 2026).
+  const bandResult = gitLoadLimitBandPvpm(f.load_limit_per_vehicle);
+  if (bandResult.referral) {
+    if (!override) {
+      return {
+        fleet_name: f.fleet_name,
+        base_pvpm: null,
+        loaded_pvpm: null,
+        iot_credit: null,
+        final_pvpm: null,
+        vehicle_count: f.vehicle_count,
+        total_monthly_premium: null,
+        annual_premium: null,
+        mandatory_security: null,
+        referral_reasons: [...referralReasons, bandResult.reason],
+        override_applied: false,
+        verdict: "REFER",
+      };
+    }
+    return { error: bandResult.reason };
+  }
+
+  const basePvpm = bandResult.pvpm;
+  const geo = GIT_GEOGRAPHIC_ZONE_LOADING[f.geographic_zone] ?? 1.0;
+  const claims = GIT_CLAIMS_HISTORY_LOADING[f.claims_history] ?? 1.0;
+  const age = GIT_FLEET_AGE_LOADING[f.fleet_age] ?? 1.0;
+  const night = GIT_NIGHT_OPS_LOADING[f.night_ops] ?? 1.0;
+  const cross = GIT_CROSS_BORDER_LOADING[f.cross_border] ?? 1.0;
+  let loadedPvpm = basePvpm * geo * claims * age * night * cross;
+
+  // v2: restricted cover tier applied before IoT credits, matching Hollard/Merx structure
+  // (restricted cover is a percentage of the All Risks premium, not stacked with IoT credits)
+  const restrictedFactor = GIT_RESTRICTED_COVER_FACTORS[f.cover_type] ?? 1.0;
+  loadedPvpm = loadedPvpm * restrictedFactor;
+
+  const iot = computeGitIotCreditStack(f);
+  const finalPvpm = loadedPvpm + loadedPvpm * iot.total_credit;
+  const security = checkGitMandatorySecurityRequirement(f);
+  let totalMonthly = security.mandatory_met ? finalPvpm * f.vehicle_count : null;
+
+  // v2: minimum annual premium floor (R5,000/policy/year, matching Hollard's GIT minimum)
+  let annualPremium = null;
+  let minPremiumApplied = false;
+  if (totalMonthly != null) {
+    const annualBeforeFloor = totalMonthly * 12;
+    if (annualBeforeFloor < GIT_MIN_ANNUAL_PREMIUM) {
+      annualPremium = GIT_MIN_ANNUAL_PREMIUM;
+      totalMonthly = GIT_MIN_ANNUAL_PREMIUM / 12;
+      minPremiumApplied = true;
+    } else {
+      annualPremium = annualBeforeFloor;
+      minPremiumApplied = false;
+    }
+  }
+
+  const overrideApplied = Boolean(override && referralReasons.length > 0);
+
+  return {
+    fleet_name: f.fleet_name,
+    base_pvpm: Math.round(basePvpm * 100) / 100,
+    loaded_pvpm: Math.round(loadedPvpm * 100) / 100,
+    iot_credit: iot,
+    final_pvpm: Math.round(finalPvpm * 100) / 100,
+    vehicle_count: f.vehicle_count,
+    total_monthly_premium: totalMonthly != null ? Math.round(totalMonthly * 100) / 100 : null,
+    annual_premium: annualPremium != null ? Math.round(annualPremium * 100) / 100 : null,
+    min_premium_applied: minPremiumApplied,
+    cover_type: f.cover_type,
+    mandatory_security: security,
+    override_applied: overrideApplied,
+    override_approver_name: overrideApplied ? override.approverName : null,
+    override_reason: overrideApplied ? override.reason : null,
+    bypassed_referral_reasons: overrideApplied ? referralReasons : null,
+    verdict: security.mandatory_met ? "QUOTABLE" : "CANNOT BIND - mandatory security requirement not met",
+  };
+}
+
+const GIT_BENCHMARK_SCENARIOS = [
+  {
+    label: "Motorworld — FMCG branded, no IoT",
+    input: makeGitFleetInput({
+      fleet_name: "Motorworld",
+      vehicle_count: 106,
+      load_limit_per_vehicle: 1500000,
+      commodity_type: "fmcg_branded_high_risk",
+    }),
+  },
+  {
+    label: "General cargo — GPS + geofencing, no RMP scope",
+    input: makeGitFleetInput({
+      fleet_name: "GeneralCargoCo",
+      vehicle_count: 50,
+      load_limit_per_vehicle: 500000,
+      commodity_type: "general_cargo",
+      iot_devices_fitted: ["gps_realtime_tracking", "geofencing_alerting"],
+    }),
+  },
+  {
+    label: "High-value cargo — RMP1-scoped, NO lock fitted",
+    input: makeGitFleetInput({
+      fleet_name: "HighValueNoLock",
+      vehicle_count: 20,
+      load_limit_per_vehicle: 800000,
+      commodity_type: "fmcg_branded_high_risk",
+      is_high_value_cargo: true,
+      is_rmp1_scoped: true,
+      cvtscpi_rmp_tier: "none",
+    }),
+  },
+  {
+    label: "High-value cargo — RMP1 fitted + Cargosnap",
+    input: makeGitFleetInput({
+      fleet_name: "HighValueCompliant",
+      vehicle_count: 20,
+      load_limit_per_vehicle: 800000,
+      commodity_type: "fmcg_branded_high_risk",
+      is_high_value_cargo: true,
+      is_rmp1_scoped: true,
+      cvtscpi_rmp_tier: "rmp1_top_lock",
+      cargosnap_fitted: true,
+    }),
+  },
+];
+
+// ---------------------------------------------------------------------------
+// HCV rating/premium engine — JS port of hcv_rating_engine.py, built from
+// TelematiX_SA_Rating_Engine_Frans_Prinsloo_3.xlsx (June 2026). Calibrated
+// from 1,961 real SA HCV claims (2020-2026), R286m gross exposure.
+//
+// This is the RATING/PREMIUM layer - it produces an actual R-value premium,
+// distinct from scoreFleet() above (HCV risk verdict only, no premium).
+//
+// Five bugs found and corrected vs the source workbook (confirmed via formula
+// inspection, not just displayed values):
+//   1-4. Manufacturer/age-band/cargo/corridor VLOOKUP ranges each excluded
+//        their own base-case (0%) row by one, causing fleets using the base
+//        case to fall back to the wrong default loading instead of 0%.
+//   5. Verdict text referenced the wrong cell for the management fee display
+//      (always showed R0.000m). Fixed to reference the real calculated fee.
+// ---------------------------------------------------------------------------
+
+function hcvExcelRound(value, digits) {
+  // Matches Excel's ROUND() (round-half-away-from-zero), avoiding JS's
+  // floating-point toFixed() quirks for values like 28.65.
+  const factor = Math.pow(10, digits);
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+const HCV_ASSET_CLASS_BASE_RATES = {
+  hcv_general_freight: 0.03,
+  fuel_hazmat_tanker: 0.022,
+  minerals_bulk_long_haul: 0.028,
+  fmcg_distribution: 0.03,
+  bulk_liquids_non_hazmat: 0.02,
+  yellow_metal_plant: 0.02,
+  agricultural_equipment: 0.016,
+  refrigerated_cold_chain: 0.022,
+  abnormal_loads_oversized: 0.03,
+  drone_commercial: 0.014,
+};
+
+const HCV_TELEMATICS_WEIGHTS = {
+  fatigue_hos: 0.20,
+  speeding: 0.15,
+  cellphone_usage: 0.15,
+  safety_belt_compliance: 0.10,
+  driver_behaviour_composite: 0.10,
+  distance_index: 0.08,
+  device_integrity: 0.07,
+  time_on_road: 0.03,
+  night_driving_ratio: 0.02,
+};
+
+const HCV_TREND_MODIFIERS = {
+  improving_strongly: -0.15,
+  improving_slightly: -0.05,
+  stable: 0.0,
+  deteriorating_slightly: 0.10,
+  deteriorating_3plus_months: 0.20,
+};
+
+const HCV_MANUFACTURER_LOADINGS = {
+  mercedes_benz: 0.0,
+  scania: 0.14,
+  volvo: -0.03,
+  faw: 0.10,
+  man: 0.08,
+  daf: 0.08,
+  ud_trucks: 0.05,
+  freightliner: -0.10,
+  western_star: 0.15,
+  hino: 0.02,
+  isuzu: 0.0,
+  other: 0.10,
+};
+const HCV_MANUFACTURER_LOADING_DEFAULT = 0.10;
+
+const HCV_AGE_BAND_LOADINGS = {
+  under_3yr: 0.05,
+  "3_to_5yr": 0.12,
+  "6_to_8yr": 0.22,
+  "9_to_11yr": 0.28,
+  "12_to_15yr": 0.15,
+  over_15yr: 0.20,
+};
+
+function classifyHcvAgeBand(yearModel) {
+  if (yearModel >= 2024) return "under_3yr";
+  else if (yearModel >= 2021) return "3_to_5yr";
+  else if (yearModel >= 2018) return "6_to_8yr";
+  else if (yearModel >= 2016) return "9_to_11yr";
+  else if (yearModel >= 2013) return "12_to_15yr";
+  else return "over_15yr";
+}
+
+const HCV_CARGO_LOADINGS = {
+  general_merchandise: 0.0,
+  fuel_petroleum: 0.35,
+  minerals_mining: 0.40,
+  fmcg_food_bev: 0.15,
+  refrigerated: 0.20,
+  steel_metals: 0.18,
+  chemicals_non_hazmat: 0.25,
+  chemicals_hazmat_adr: 0.55,
+  electronics_high_value: 0.45,
+  agricultural_produce: 0.12,
+  retail_clothing: 0.10,
+  livestock: 0.30,
+};
+const HCV_CARGO_LOADING_DEFAULT = 0.10;
+
+const HCV_CORRIDOR_LOADINGS = {
+  mixed_sa_national: 0.0,
+  n1_cape_johannesburg: 0.12,
+  n3_johannesburg_durban: 0.18,
+  n12_east_rand_port_elizabeth: 0.15,
+  n14_n4_botswana_border: 0.20,
+  n1_north_limpopo_zimbabwe_border: 0.22,
+  western_cape_regional: 0.08,
+  kwazulu_natal_regional: 0.10,
+  northern_cape_manganese_routes: 0.35,
+  cross_border_sadc: 0.30,
+};
+const HCV_CORRIDOR_LOADING_DEFAULT = 0.10;
+
+const HCV_ANTI_THEFT_CREDITS = {
+  none: 0.0,
+  tracking_only: -0.06,
+  tracking_and_immobiliser: -0.12,
+};
+
+const HCV_MANAGEMENT_FEE_RATE = 0.11;
+
+// Fleet-size base-rate multiplier (Lombard reference slide, Frans-confirmed
+// 9 July 2026). MULTIPLIES the existing asset-class base rate -- does not
+// replace it. Extrapolates the X-Large rate indefinitely above 100 vehicles.
+// Medium chosen as the 1.0x baseline.
+const HCV_FLEET_SIZE_BASELINE_RATE = 0.0525;
+const HCV_FLEET_SIZE_TIERS = [
+  { label: "Small", minVehicles: 1, maxVehicles: 5, targetRate: 0.06 },
+  { label: "Medium", minVehicles: 6, maxVehicles: 20, targetRate: 0.0525 },
+  { label: "Large", minVehicles: 21, maxVehicles: 50, targetRate: 0.0475 },
+  { label: "X-Large", minVehicles: 51, maxVehicles: Infinity, targetRate: 0.04 },
+];
+function hcvFleetSizeMultiplier(vehicleCount) {
+  const tier =
+    HCV_FLEET_SIZE_TIERS.find((t) => vehicleCount >= t.minVehicles && vehicleCount <= t.maxVehicles) ||
+    HCV_FLEET_SIZE_TIERS[HCV_FLEET_SIZE_TIERS.length - 1];
+  return hcvExcelRound(tier.targetRate / HCV_FLEET_SIZE_BASELINE_RATE, 6);
+}
+
+// Claims-experience loading (Lombard reference slide, Frans-confirmed).
+// ADDITIVE to the existing market loading stack. No claims history
+// defaults to the highest band (30%), same conservative-default
+// principle as the no-telemetry fallback.
+const HCV_CLAIMS_EXPERIENCE_NO_HISTORY_LOADING = 0.00; // Frans-confirmed 9 July 2026: opt-in only -- no penalty unless a real loss ratio is entered
+const HCV_CLAIMS_EXPERIENCE_BANDS = [
+  { minLossRatioPct: 0, maxLossRatioPct: 60, loading: 0.05 },
+  { minLossRatioPct: 61, maxLossRatioPct: 70, loading: 0.10 },
+  { minLossRatioPct: 71, maxLossRatioPct: 85, loading: 0.20 },
+  { minLossRatioPct: 86, maxLossRatioPct: 90, loading: 0.25 },
+  { minLossRatioPct: 91, maxLossRatioPct: Infinity, loading: 0.30 },
+];
+function hcvClaimsExperienceLoading(lossRatioPct) {
+  if (lossRatioPct == null) return HCV_CLAIMS_EXPERIENCE_NO_HISTORY_LOADING;
+  const band =
+    HCV_CLAIMS_EXPERIENCE_BANDS.find((b) => lossRatioPct >= b.minLossRatioPct && lossRatioPct <= b.maxLossRatioPct) ||
+    HCV_CLAIMS_EXPERIENCE_BANDS[HCV_CLAIMS_EXPERIENCE_BANDS.length - 1];
+  return band.loading;
+}
+
+// Static risk questionnaire (Lombard reference slide + Frans-confirmed
+// scope). 7 items, each 0-100, averaged into a 10% weighted factor
+// matching the pitch deck's 10-factor model. avg km/month, cargo type,
+// and Route Risk Level deliberately excluded -- already price elsewhere.
+// NO SCORING RUBRIC EXISTS YET for what makes each item score 20 vs 80 --
+// that's Frans's call, not invented here.
+const HCV_STATIC_QUESTIONNAIRE_ITEMS = [
+  "driving_hour_policy",
+  "max_speed_policy",
+  "telematics_use_for_driver_management",
+  "route_distance",
+  "driver_training_programme",
+  "driver_employment_process",
+  "driver_remuneration",
+];
+function hcvComputeStaticRiskScore(f) {
+  const values = HCV_STATIC_QUESTIONNAIRE_ITEMS.map((k) => f[k]);
+  if (values.some((v) => v == null)) return null;
+  const sum = values.reduce((a, b) => a + b, 0);
+  return hcvExcelRound(sum / HCV_STATIC_QUESTIONNAIRE_ITEMS.length, 1);
+}
+
+// Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology, Q1):
+// top of the Medium band (31-65), not the workbook's own mixed-band sample
+// defaults, which compute to a near-cheapest rating factor and are NOT a
+// conservative "no data" fallback.
+const HCV_NO_TELEMETRY_DEFAULT_SCORE = 65;
+
+const HCV_AUTO_DECLINE_KM_PER_MONTH_THRESHOLD = 16000;
+const HCV_AUTO_DECLINE_CONCEALMENT_THRESHOLD = 200;
+const HCV_AUTO_DECLINE_SPEEDING_THRESHOLD = 60;
+const HCV_AUTO_DECLINE_FATIGUE_THRESHOLD = 80;
+
+function makeHcvFleetInput(overrides) {
+  return {
+    fleet_name: "",
+    asset_class: "hcv_general_freight",
+    vehicle_count: 0,
+    avg_sum_insured_per_vehicle: 0,
+    manufacturer: "mercedes_benz",
+    year_model: new Date().getFullYear(),
+    avg_km_per_vehicle_month: 0,
+    // Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology).
+    // Defaults to true so existing behaviour is unchanged unless explicitly
+    // toggled off in the HCV Rating tab.
+    telemetry_available: true,
+    fatigue_hos: 0,
+    speeding: 0,
+    cellphone_usage: 0,
+    safety_belt_compliance: 0,
+    driver_behaviour_composite: 0,
+    distance_index: 0,
+    device_integrity: 0,
+    time_on_road: 0,
+    night_driving_ratio: 0,
+    trend_direction: "stable",
+    device_concealment_events_per_month: 0,
+    static_questionnaire_complete: true,
+    cargo_type: "general_merchandise",
+    operating_corridor: "mixed_sa_national",
+    night_ops_pct: 0.0,
+    anti_theft_devices: "none",
+    // NEW: claims experience + static risk questionnaire (Frans-confirmed,
+    // Lombard reference slide). loss_ratio_pct null = no claims history
+    // (defaults to worst band, 30%). Static items null = falls back to
+    // the existing flat +10 questionnaire-completeness penalty.
+    loss_ratio_pct: null,
+    driving_hour_policy: null,
+    max_speed_policy: null,
+    telematics_use_for_driver_management: null,
+    route_distance: null,
+    driver_training_programme: null,
+    driver_employment_process: null,
+    driver_remuneration: null,
+    ...overrides,
+  };
+}
+
+function computeHcvWeightedTelematicsScore(f) {
+  let total = 0.0;
+  for (const factor of Object.keys(HCV_TELEMATICS_WEIGHTS)) {
+    total += f[factor] * HCV_TELEMATICS_WEIGHTS[factor];
+  }
+  // NEW: static risk questionnaire, 10% weight, only when all 7 items are
+  // supplied -- Frans-confirmed scope (Lombard reference slide).
+  const staticRiskScore = hcvComputeStaticRiskScore(f);
+  if (staticRiskScore != null) total += staticRiskScore * 0.10;
+  return hcvExcelRound(total, 1);
+}
+
+function computeHcvCombinedTelematicsScore(f, weightedScore) {
+  let concealmentAddition = 0;
+  if (f.device_concealment_events_per_month > 200) concealmentAddition = 30;
+  else if (f.device_concealment_events_per_month > 100) concealmentAddition = 15;
+
+  // NEW: skip the flat penalty when the richer static questionnaire
+  // score is being used -- it already reflects completeness/quality.
+  const usingNewStaticScoreForPenalty = hcvComputeStaticRiskScore(f) != null;
+  const questionnairePenalty = usingNewStaticScoreForPenalty ? 0 : (!f.static_questionnaire_complete ? 10 : 0);
+  const trendModifier = HCV_TREND_MODIFIERS[f.trend_direction] ?? 0.0;
+  const trendAddition = weightedScore * trendModifier;
+
+  const combined = weightedScore + concealmentAddition + questionnairePenalty + trendAddition;
+  return hcvExcelRound(combined, 0);
+}
+
+function checkHcvAutoDecline(f, combinedScore) {
+  const triggers = [];
+  if (combinedScore > 100) {
+    triggers.push(`Combined telematics score ${combinedScore.toFixed(0)} exceeds 100`);
+  }
+  if (f.avg_km_per_vehicle_month > HCV_AUTO_DECLINE_KM_PER_MONTH_THRESHOLD) {
+    triggers.push(
+      `Avg km/vehicle/month ${f.avg_km_per_vehicle_month.toLocaleString()} exceeds ${HCV_AUTO_DECLINE_KM_PER_MONTH_THRESHOLD.toLocaleString()} (illegal HoS for single driver)`
+    );
+  }
+  if (f.device_concealment_events_per_month > HCV_AUTO_DECLINE_CONCEALMENT_THRESHOLD) {
+    triggers.push(
+      `Device concealment events ${f.device_concealment_events_per_month}/mo exceeds ${HCV_AUTO_DECLINE_CONCEALMENT_THRESHOLD}`
+    );
+  }
+  if (f.speeding > HCV_AUTO_DECLINE_SPEEDING_THRESHOLD && f.fatigue_hos > HCV_AUTO_DECLINE_FATIGUE_THRESHOLD) {
+    triggers.push(`Speeding (${f.speeding}) AND Fatigue (${f.fatigue_hos}) both breach simultaneously`);
+  }
+  return triggers;
+}
+
+function hcvTelematicsRatingFactor(combinedScore) {
+  if (combinedScore > 100) return null;
+  else if (combinedScore <= 25) return 0.70;
+  else if (combinedScore <= 45) return 0.95;
+  else if (combinedScore <= 65) return 1.40;
+  else if (combinedScore <= 85) return 1.90;
+  else return 2.50;
+}
+
+function computeHcvPremium(f) {
+  const weightedScore = computeHcvWeightedTelematicsScore(f);
+  const staticRiskScoreForOutput = hcvComputeStaticRiskScore(f);
+  const combinedScore = computeHcvCombinedTelematicsScore(f, weightedScore);
+
+  const autoDeclineReasons = checkHcvAutoDecline(f, combinedScore);
+  if (autoDeclineReasons.length > 0) {
+    return {
+      fleet_name: f.fleet_name,
+      weighted_telematics_score: weightedScore,
+      combined_telematics_score: combinedScore,
+      rating_factor: null,
+      total_sa_market_loading: null,
+      combined_rating_factor: null,
+      total_fleet_sum_insured: f.vehicle_count * f.avg_sum_insured_per_vehicle,
+      market_rate_base_premium: null,
+      risk_adjusted_premium: null,
+      premium_saving_vs_market: null,
+      additional_premium_vs_market: null,
+      management_fee: null,
+      auto_decline_reasons: autoDeclineReasons,
+      verdict: "DECLINE - Auto-decline triggered. Do not quote.",
+    };
+  }
+
+  const ratingFactor = hcvTelematicsRatingFactor(combinedScore);
+
+  const manufacturerLoading = HCV_MANUFACTURER_LOADINGS[f.manufacturer] ?? HCV_MANUFACTURER_LOADING_DEFAULT;
+  const ageBand = classifyHcvAgeBand(f.year_model);
+  const ageBandLoading = HCV_AGE_BAND_LOADINGS[ageBand] ?? 0.20;
+  const cargoLoading = HCV_CARGO_LOADINGS[f.cargo_type] ?? HCV_CARGO_LOADING_DEFAULT;
+  const corridorLoading = HCV_CORRIDOR_LOADINGS[f.operating_corridor] ?? HCV_CORRIDOR_LOADING_DEFAULT;
+  const antiTheftCredit = HCV_ANTI_THEFT_CREDITS[f.anti_theft_devices] ?? 0.0;
+  const nightOpsLoading = f.night_ops_pct > 0.20 ? 0.10 : f.night_ops_pct > 0.10 ? 0.05 : 0.0;
+
+  const claimsExperienceLoading = hcvClaimsExperienceLoading(f.loss_ratio_pct);
+  const totalSaMarketLoading = hcvExcelRound(
+    manufacturerLoading + ageBandLoading + cargoLoading + corridorLoading + antiTheftCredit + nightOpsLoading + claimsExperienceLoading,
+    4
+  );
+  const combinedRatingFactor = hcvExcelRound(ratingFactor * (1 + totalSaMarketLoading), 4);
+
+  const assetClassBaseRate = HCV_ASSET_CLASS_BASE_RATES[f.asset_class];
+  if (assetClassBaseRate == null) {
+    return { error: `Unknown asset_class: ${f.asset_class}` };
+  }
+  const fleetSizeMultiplier = hcvFleetSizeMultiplier(f.vehicle_count);
+  const baseRate = hcvExcelRound(assetClassBaseRate * fleetSizeMultiplier, 8);
+
+  const totalFleetSumInsured = f.vehicle_count * f.avg_sum_insured_per_vehicle;
+  const marketRateBasePremium = totalFleetSumInsured * baseRate;
+  const riskAdjustedPremium = totalFleetSumInsured * baseRate * combinedRatingFactor;
+
+  const premiumSavingVsMarket = Math.max(0.0, marketRateBasePremium - riskAdjustedPremium);
+  const additionalPremiumVsMarket = Math.max(0.0, riskAdjustedPremium - marketRateBasePremium);
+  const managementFee = riskAdjustedPremium * HCV_MANAGEMENT_FEE_RATE;
+
+  let verdict, profile;
+  if (combinedScore <= 45) {
+    verdict = `ACCEPT - Profile A. Score: ${combinedScore.toFixed(0)} | Factor: ${combinedRatingFactor.toFixed(2)}x | Premium: R${riskAdjustedPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} | Fee: R${managementFee.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Conditions: monthly data sharing, annual questionnaire.`;
+    profile = "A";
+  } else if (combinedScore <= 85) {
+    verdict = `CONDITIONAL ACCEPT - Profile B. Score: ${combinedScore.toFixed(0)} | Factor: ${combinedRatingFactor.toFixed(2)}x | Premium: R${riskAdjustedPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Mandatory: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right.`;
+    profile = "B";
+  } else {
+    verdict = `DECLINE - Score ${combinedScore.toFixed(0)} exceeds 85. Profile C threshold. Do not quote.`;
+    profile = "C";
+  }
+
+  // Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology, Q2):
+  // a fleet without real telemetry can never reach Profile A auto-accept,
+  // regardless of computed score -- downgrade to Profile B here.
+  if (profile === "A" && !f.telemetry_available) {
+    profile = "B";
+    verdict = `CONDITIONAL ACCEPT - Profile B (capped from Profile A: no real telemetry data -- estimated scores only, per underwriting policy). Score: ${combinedScore.toFixed(0)} | Factor: ${combinedRatingFactor.toFixed(2)}x | Premium: R${riskAdjustedPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Mandatory: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right.`;
+  }
+
+  return {
+    fleet_name: f.fleet_name,
+    weighted_telematics_score: weightedScore,
+    combined_telematics_score: combinedScore,
+    rating_factor: ratingFactor,
+    manufacturer_loading: manufacturerLoading,
+    age_band: ageBand,
+    age_band_loading: ageBandLoading,
+    cargo_loading: cargoLoading,
+    corridor_loading: corridorLoading,
+    anti_theft_credit: antiTheftCredit,
+    night_ops_loading: nightOpsLoading,
+    claims_experience_loading: claimsExperienceLoading,
+    total_sa_market_loading: totalSaMarketLoading,
+    combined_rating_factor: combinedRatingFactor,
+    asset_class_base_rate: assetClassBaseRate,
+    fleet_size_multiplier: fleetSizeMultiplier,
+    static_risk_score: staticRiskScoreForOutput,
+    total_fleet_sum_insured: hcvExcelRound(totalFleetSumInsured, 2),
+    market_rate_base_premium: hcvExcelRound(marketRateBasePremium, 2),
+    risk_adjusted_premium: hcvExcelRound(riskAdjustedPremium, 2),
+    premium_saving_vs_market: hcvExcelRound(premiumSavingVsMarket, 2),
+    additional_premium_vs_market: hcvExcelRound(additionalPremiumVsMarket, 2),
+    management_fee: hcvExcelRound(managementFee, 2),
+    profile,
+    verdict,
+  };
+}
+
+function HcvRatingView({ sharedFleetInfo }) {
+  const [form, setForm] = useState(() =>
+    makeHcvFleetInput(
+      sharedFleetInfo
+        ? {
+            fleet_name: sharedFleetInfo.fleet_name,
+            vehicle_count: sharedFleetInfo.vehicle_count,
+            asset_class: sharedFleetInfo.asset_class,
+            avg_sum_insured_per_vehicle: sharedFleetInfo.avg_sum_insured_per_vehicle,
+            manufacturer: sharedFleetInfo.manufacturer,
+            year_model: sharedFleetInfo.year_model,
+            avg_km_per_vehicle_month: sharedFleetInfo.avg_km_per_vehicle_month,
+            cargo_type: sharedFleetInfo.cargo_type,
+            operating_corridor: sharedFleetInfo.operating_corridor,
+            night_ops_pct: sharedFleetInfo.night_ops_pct,
+            anti_theft_devices: sharedFleetInfo.anti_theft_devices,
+            trend_direction: sharedFleetInfo.trend_direction,
+            device_concealment_events_per_month: sharedFleetInfo.device_concealment_events_per_month,
+            static_questionnaire_complete: sharedFleetInfo.static_questionnaire_complete,
+            loss_ratio_pct: sharedFleetInfo.loss_ratio_pct,
+          }
+        : {}
+    )
+  );
+  const [result, setResult] = useState(null);
+
+  const updateField = (key, value) => {
+    setForm((f) => ({ ...f, [key]: value }));
+  };
+
+  const computeQuote = () => {
+    setResult(computeHcvPremium(form));
+  };
+
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: "0.75rem",
+          color: "#B5762A",
+          marginBottom: "16px",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+        }}
+      >
+        HCV Rating
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Fleet &amp; vehicle details</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          <FormField label="Fleet name">
+            <input
+              type="text"
+              value={form.fleet_name}
+              onChange={(e) => updateField("fleet_name", e.target.value)}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Asset class">
+            <select
+              value={form.asset_class}
+              onChange={(e) => updateField("asset_class", e.target.value)}
+              style={formInputStyle}
+            >
+              {Object.keys(HCV_ASSET_CLASS_BASE_RATES)
+                .sort((a, b) => a.localeCompare(b))
+                .map((key) => (
+                  <option key={key} value={key}>
+                    {key.replace(/_/g, " ")}
+                  </option>
+                ))}
+            </select>
+          </FormField>
+          <FormField label="Number of vehicles">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.vehicle_count}
+              onChange={(e) => updateField("vehicle_count", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Avg sum insured per vehicle (R)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.avg_sum_insured_per_vehicle}
+              onChange={(e) => updateField("avg_sum_insured_per_vehicle", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              step="50000"
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Manufacturer">
+            <select
+              value={form.manufacturer}
+              onChange={(e) => updateField("manufacturer", e.target.value)}
+              style={formInputStyle}
+            >
+              {Object.keys(HCV_MANUFACTURER_LOADINGS)
+                .sort((a, b) => a.localeCompare(b))
+                .map((key) => (
+                  <option key={key} value={key}>
+                    {key.replace(/_/g, " ")}
+                  </option>
+                ))}
+            </select>
+          </FormField>
+          <FormField label="Average vehicle year model">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.year_model}
+              onChange={(e) => updateField("year_model", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Avg km / vehicle / month">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.avg_km_per_vehicle_month}
+              onChange={(e) => updateField("avg_km_per_vehicle_month", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Telematics behavioural scores (0–100, approved platform)</SectionLabel>
+
+        <label style={{ ...checkboxLabelStyle, marginTop: "10px", marginBottom: "10px", display: "flex" }}>
+          <input
+            type="checkbox"
+            checked={form.telemetry_available}
+            onChange={(e) => {
+              const available = e.target.checked;
+              setForm((f) => {
+                if (available) return { ...f, telemetry_available: true };
+                // Frans-confirmed Q1: default every score to top-of-Medium (65)
+                // when real telemetry isn't available.
+                return {
+                  ...f,
+                  telemetry_available: false,
+                  fatigue_hos: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  speeding: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  cellphone_usage: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  safety_belt_compliance: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  driver_behaviour_composite: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  distance_index: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  device_integrity: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  time_on_road: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                  night_driving_ratio: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                };
+              });
+            }}
+          />
+          Real telemetry data available for this fleet
+        </label>
+        {!form.telemetry_available && (
+          <div style={{ fontSize: "0.78rem", color: "#B5762A", marginBottom: "10px", lineHeight: 1.5 }}>
+            No real telemetry — scores defaulted to {HCV_NO_TELEMETRY_DEFAULT_SCORE} (top of Medium band).
+            This fleet is capped at Profile B (Conditional Accept) regardless of computed score.
+          </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          {[
+            ["fatigue_hos", "Fatigue / Hours of Service"],
+            ["speeding", "Speeding"],
+            ["cellphone_usage", "Cellphone usage (talk + text)"],
+            ["safety_belt_compliance", "Safety belt compliance"],
+            ["driver_behaviour_composite", "Driver behaviour composite"],
+            ["distance_index", "Distance index"],
+            ["device_integrity", "Device integrity"],
+            ["time_on_road", "Time on road"],
+            ["night_driving_ratio", "Night driving ratio"],
+          ].map(([key, label]) => (
+            <FormField key={key} label={label}>
+              <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                type="number"
+                min="0"
+                max="100"
+                value={form[key]}
+                disabled={!form.telemetry_available}
+                onChange={(e) => updateField(key, Number(e.target.value))}
+                onWheel={(e) => e.target.blur()}
+                style={{ ...formInputStyle, opacity: form.telemetry_available ? 1 : 0.6 }}
+              />
+            </FormField>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Telematics score modifiers</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          <FormField label="Trend direction (3-month rolling)">
+            <select
+              value={form.trend_direction}
+              onChange={(e) => updateField("trend_direction", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="improving_strongly">Improving strongly (-15%)</option>
+              <option value="improving_slightly">Improving slightly (-5%)</option>
+              <option value="stable">Stable (0%)</option>
+              <option value="deteriorating_slightly">Deteriorating slightly (+10%)</option>
+              <option value="deteriorating_3plus_months">Deteriorating - 3+ months (+20%)</option>
+            </select>
+          </FormField>
+          <FormField label="Device concealment events/month">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.device_concealment_events_per_month}
+              onChange={(e) => updateField("device_concealment_events_per_month", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Static questionnaire complete?">
+            <select
+              value={form.static_questionnaire_complete ? "yes" : "no"}
+              onChange={(e) => updateField("static_questionnaire_complete", e.target.value === "yes")}
+              style={formInputStyle}
+            >
+              <option value="yes">Yes</option>
+              <option value="no">No</option>
+            </select>
+          </FormField>
+          <FormField label="Loss ratio % (blank = 0% loading, opt-in only)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              min="0"
+              value={form.loss_ratio_pct ?? ""}
+              onChange={(e) => updateField("loss_ratio_pct", e.target.value === "" ? null : Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Static risk questionnaire (optional -- 7 items, 0-100 each)</SectionLabel>
+        <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "8px", marginBottom: "10px", lineHeight: 1.5 }}>
+          Leave blank to use the Yes/No completeness check above instead. Fill in all 7 to use the
+          richer 10%-weighted score (Frans-confirmed scope) -- no scoring rubric published yet, use
+          underwriting judgement.
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          {[
+            ["driving_hour_policy", "Driving hour policy"],
+            ["max_speed_policy", "Max speed policy"],
+            ["telematics_use_for_driver_management", "Telematics use for driver mgmt"],
+            ["route_distance", "Route distance"],
+            ["driver_training_programme", "Driver training programme"],
+            ["driver_employment_process", "Driver employment process"],
+            ["driver_remuneration", "Driver remuneration"],
+          ].map(([key, label]) => (
+            <FormField key={key} label={label}>
+              <input
+                onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                type="number"
+                min="0"
+                max="100"
+                value={form[key] ?? ""}
+                onChange={(e) => updateField(key, e.target.value === "" ? null : Number(e.target.value))}
+                onWheel={(e) => e.target.blur()}
+                style={formInputStyle}
+              />
+            </FormField>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "24px" }}>
+        <SectionLabel>SA market peril &amp; event profile</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          <FormField label="Primary cargo type">
+            <select
+              value={form.cargo_type}
+              onChange={(e) => updateField("cargo_type", e.target.value)}
+              style={formInputStyle}
+            >
+              {Object.keys(HCV_CARGO_LOADINGS)
+                .sort((a, b) => a.localeCompare(b))
+                .map((key) => (
+                  <option key={key} value={key}>
+                    {key.replace(/_/g, " ")}
+                  </option>
+                ))}
+            </select>
+          </FormField>
+          <FormField label="Primary operating corridor">
+            <select
+              value={form.operating_corridor}
+              onChange={(e) => updateField("operating_corridor", e.target.value)}
+              style={formInputStyle}
+            >
+              {Object.keys(HCV_CORRIDOR_LOADINGS)
+                .sort((a, b) => a.localeCompare(b))
+                .map((key) => (
+                  <option key={key} value={key}>
+                    {key.replace(/_/g, " ")}
+                  </option>
+                ))}
+            </select>
+          </FormField>
+          <FormField label="Night operations (% distance after 22:00)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              min="0"
+              max="100"
+              value={Math.round(form.night_ops_pct * 100)}
+              onChange={(e) => updateField("night_ops_pct", Number(e.target.value) / 100)}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Anti-theft devices fitted">
+            <select
+              value={form.anti_theft_devices}
+              onChange={(e) => updateField("anti_theft_devices", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="none">None</option>
+              <option value="tracking_only">Tracking only</option>
+              <option value="tracking_and_immobiliser">Tracking + immobiliser</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
+      <button
+        className="tx-btn"
+        onClick={computeQuote}
+        style={{
+          background: "#14213D",
+          color: "#FAF7F0",
+          border: "none",
+          borderRadius: "5px",
+          padding: "10px 20px",
+          fontSize: "0.9rem",
+          fontWeight: 600,
+          cursor: "pointer",
+          fontFamily: "'Inter', sans-serif",
+          marginBottom: "24px",
+        }}
+      >
+        Compute quote
+      </button>
+
+      {result && !result.error && result.verdict.startsWith("DECLINE - Auto-decline") && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "20px" }}>
+            <StampBadge verdict="DECLINE" />
+            <div>
+              <div style={{ fontSize: "0.95rem", fontWeight: 600, color: "#14213D", lineHeight: 1.4 }}>
+                {(result.auto_decline_reasons && result.auto_decline_reasons[0]) || "Auto-decline triggered"}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#5C6570", marginTop: "2px" }}>
+                No premium calculated - hard auto-decline rule triggered
+              </div>
+            </div>
+          </div>
+          {(result.auto_decline_reasons || []).length > 1 && (
+            <div>
+              <SectionLabel>All auto-decline reasons</SectionLabel>
+              <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+                {result.auto_decline_reasons.map((reason, i) => (
+                  <li key={i}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {result && !result.error && !result.verdict.startsWith("DECLINE - Auto-decline") && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "24px" }}>
+            <StampBadge
+              verdict={
+                result.verdict.startsWith("ACCEPT")
+                  ? "ACCEPT"
+                  : result.verdict.startsWith("CONDITIONAL ACCEPT")
+                  ? "CONDITIONAL ACCEPT"
+                  : "DECLINE"
+              }
+            />
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "1.4rem", fontWeight: 700 }}>
+                {result.risk_adjusted_premium != null ? "R" + result.risk_adjusted_premium.toLocaleString() : "\u2014"}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#5C6570" }}>Risk-adjusted annual premium</div>
+            </div>
+          </div>
+
+          <div style={{ background: "#F1ECE0", borderRadius: "6px", padding: "16px 18px", marginBottom: "20px" }}>
+            <div style={{ fontSize: "0.9rem", lineHeight: 1.5 }}>{result.verdict}</div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px", marginBottom: "22px" }}>
+            <StatBox label="Weighted telematics score" value={result.weighted_telematics_score} />
+            <StatBox label="Combined telematics score" value={result.combined_telematics_score} />
+            <StatBox label="Rating factor" value={result.rating_factor != null ? result.rating_factor.toFixed(2) + "x" : "\u2014"} />
+            <StatBox label="Combined rating factor" value={result.combined_rating_factor != null ? result.combined_rating_factor.toFixed(2) + "x" : "\u2014"} />
+            <StatBox label="Total fleet sum insured" value={"R" + result.total_fleet_sum_insured.toLocaleString()} />
+            <StatBox label="Market rate base premium" value={"R" + result.market_rate_base_premium.toLocaleString()} />
+            <StatBox
+              label="Premium saving vs market"
+              value={result.premium_saving_vs_market > 0 ? "R" + result.premium_saving_vs_market.toLocaleString() : "\u2014"}
+            />
+            <StatBox
+              label="Additional premium vs market"
+              value={result.additional_premium_vs_market > 0 ? "R" + result.additional_premium_vs_market.toLocaleString() : "\u2014"}
+            />
+            <StatBox label="Management fee (11%)" value={"R" + result.management_fee.toLocaleString()} />
+            <StatBox
+              label="Fleet size tier"
+              value={
+                result.fleet_size_multiplier != null
+                  ? (HCV_FLEET_SIZE_TIERS.find((t) => form.vehicle_count >= t.minVehicles && form.vehicle_count <= t.maxVehicles) || HCV_FLEET_SIZE_TIERS[HCV_FLEET_SIZE_TIERS.length - 1]).label + " (" + result.fleet_size_multiplier.toFixed(2) + "x)"
+                  : "\u2014"
+              }
+            />
+            <StatBox
+              label="Static risk score (7-item)"
+              value={result.static_risk_score != null ? result.static_risk_score.toFixed(1) : "Not scored -- using Yes/No flag"}
+            />
+          </div>
+
+          <div>
+            <SectionLabel>SA market loading breakdown</SectionLabel>
+            <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+              <li>Manufacturer ({form.manufacturer.replace(/_/g, " ")}): {(result.manufacturer_loading * 100).toFixed(0)}%</li>
+              <li>Vehicle age band ({result.age_band.replace(/_/g, " ")}): {(result.age_band_loading * 100).toFixed(0)}%</li>
+              <li>Cargo / peril ({form.cargo_type.replace(/_/g, " ")}): {(result.cargo_loading * 100).toFixed(0)}%</li>
+              <li>Corridor / route ({form.operating_corridor.replace(/_/g, " ")}): {(result.corridor_loading * 100).toFixed(0)}%</li>
+              <li>Anti-theft device credit: {(result.anti_theft_credit * 100).toFixed(0)}%</li>
+              <li>Night operations: {(result.night_ops_loading * 100).toFixed(0)}%</li>
+              <li>Claims experience{form.loss_ratio_pct != null ? ` (${form.loss_ratio_pct}% loss ratio)` : " (no claims history)"}: {(result.claims_experience_loading * 100).toFixed(0)}%</li>
+              <li><strong>Total SA market loading: {(result.total_sa_market_loading * 100).toFixed(0)}%</strong></li>
+            </ul>
+          </div>
+        </div>
+      )}
+      {result && result.error && (
+        <div style={{ color: "#B23A2E", fontSize: "0.85rem", fontFamily: "'IBM Plex Mono', monospace" }}>
+          {result.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function makeFleetInfoDefaults() {
+  return {
+    // Shared
+    fleet_name: "",
+    vehicle_count: 0,
+    // HCV block
+    asset_class: "hcv_general_freight",
+    avg_sum_insured_per_vehicle: 0,
+    manufacturer: "mercedes_benz",
+    year_model: new Date().getFullYear(),
+    avg_km_per_vehicle_month: 0,
+    cargo_type: "general_merchandise",
+    operating_corridor: "mixed_sa_national",
+    night_ops_pct: 0.0,
+    anti_theft_devices: "none",
+    trend_direction: "stable",
+    device_concealment_events_per_month: 0,
+    static_questionnaire_complete: true,
+    // GIT block
+    load_limit_per_vehicle: 0,
+    commodity_type: "general_cargo",
+    geographic_zone: "western_cape",
+    claims_history: "clean",
+    loss_ratio_pct: null,
+    cover_type: "all_risks",
+    iot_devices_fitted: [],
+    cargosnap_fitted: false,
+    cvtscpi_rmp_tier: "none",
+    is_high_value_cargo: false,
+    is_rmp1_scoped: false,
+  };
+}
+
+function FleetInformationView({ sharedFleetInfo, onSave }) {
+  const [form, setForm] = useState(sharedFleetInfo || makeFleetInfoDefaults());
+  const [saved, setSaved] = useState(false);
+
+  const updateField = (key, value) => {
+    setSaved(false);
+    setForm((f) => ({ ...f, [key]: value }));
+  };
+
+  const toggleIotDevice = (device) => {
+    setSaved(false);
+    setForm((f) => {
+      const has = f.iot_devices_fitted.includes(device);
+      return {
+        ...f,
+        iot_devices_fitted: has
+          ? f.iot_devices_fitted.filter((d) => d !== device)
+          : [...f.iot_devices_fitted, device],
+      };
+    });
+  };
+
+  const handleSave = () => {
+    onSave(form);
+    setSaved(true);
+  };
+
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: "0.75rem",
+          color: "#B5762A",
+          marginBottom: "16px",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+        }}
+      >
+        Fleet Information
+      </div>
+      <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "20px", lineHeight: 1.5 }}>
+        Capture fleet details here once, then open HCV Rating or GIT Quoting — each will start pre-filled
+        from what you save below. Fields are still editable on each tab afterward.
+      </div>
+
+      {/* Shared section */}
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Shared fleet details</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          <FormField label="Fleet name">
+            <input
+              type="text"
+              value={form.fleet_name}
+              onChange={(e) => updateField("fleet_name", e.target.value)}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Number of vehicles">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.vehicle_count}
+              onChange={(e) => updateField("vehicle_count", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+        </div>
+      </div>
+
+      {/* HCV block */}
+      <div style={{ border: "1.5px solid #14213D", borderRadius: "8px", padding: "18px", marginBottom: "20px" }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.72rem", color: "#14213D", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "14px" }}>
+          HCV Rating inputs
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px" }}>
+          <FormField label="Asset class">
+            <select value={form.asset_class} onChange={(e) => updateField("asset_class", e.target.value)} style={formInputStyle}>
+              {Object.keys(HCV_ASSET_CLASS_BASE_RATES).sort((a, b) => a.localeCompare(b)).map((key) => (
+                <option key={key} value={key}>{key.replace(/_/g, " ")}</option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Avg sum insured per vehicle (R)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.avg_sum_insured_per_vehicle} onChange={(e) => updateField("avg_sum_insured_per_vehicle", Number(e.target.value))} onWheel={(e) => e.target.blur()} step="50000" style={formInputStyle} />
+          </FormField>
+          <FormField label="Manufacturer">
+            <select value={form.manufacturer} onChange={(e) => updateField("manufacturer", e.target.value)} style={formInputStyle}>
+              {Object.keys(HCV_MANUFACTURER_LOADINGS).sort((a, b) => a.localeCompare(b)).map((key) => (
+                <option key={key} value={key}>{key.replace(/_/g, " ")}</option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Average vehicle year model">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.year_model} onChange={(e) => updateField("year_model", Number(e.target.value))} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+          </FormField>
+          <FormField label="Avg km / vehicle / month">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.avg_km_per_vehicle_month} onChange={(e) => updateField("avg_km_per_vehicle_month", Number(e.target.value))} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+          </FormField>
+          <FormField label="Primary cargo type (HCV)">
+            <select value={form.cargo_type} onChange={(e) => updateField("cargo_type", e.target.value)} style={formInputStyle}>
+              {Object.keys(HCV_CARGO_LOADINGS).sort((a, b) => a.localeCompare(b)).map((key) => (
+                <option key={key} value={key}>{key.replace(/_/g, " ")}</option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Primary operating corridor">
+            <select value={form.operating_corridor} onChange={(e) => updateField("operating_corridor", e.target.value)} style={formInputStyle}>
+              {Object.keys(HCV_CORRIDOR_LOADINGS).sort((a, b) => a.localeCompare(b)).map((key) => (
+                <option key={key} value={key}>{key.replace(/_/g, " ")}</option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Night operations (% distance after 22:00)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" min="0" max="100" value={Math.round(form.night_ops_pct * 100)} onChange={(e) => updateField("night_ops_pct", Number(e.target.value) / 100)} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+          </FormField>
+          <FormField label="Anti-theft devices fitted (HCV)">
+            <select value={form.anti_theft_devices} onChange={(e) => updateField("anti_theft_devices", e.target.value)} style={formInputStyle}>
+              <option value="none">None</option>
+              <option value="tracking_only">Tracking only</option>
+              <option value="tracking_and_immobiliser">Tracking + immobiliser</option>
+            </select>
+          </FormField>
+          <FormField label="Trend direction (3-month rolling)">
+            <select value={form.trend_direction} onChange={(e) => updateField("trend_direction", e.target.value)} style={formInputStyle}>
+              <option value="improving_strongly">Improving strongly (-15%)</option>
+              <option value="improving_slightly">Improving slightly (-5%)</option>
+              <option value="stable">Stable (0%)</option>
+              <option value="deteriorating_slightly">Deteriorating slightly (+10%)</option>
+              <option value="deteriorating_3plus_months">Deteriorating - 3+ months (+20%)</option>
+            </select>
+          </FormField>
+          <FormField label="Device concealment events/month">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.device_concealment_events_per_month} onChange={(e) => updateField("device_concealment_events_per_month", Number(e.target.value))} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+          </FormField>
+          <FormField label="Static questionnaire complete?">
+            <select value={form.static_questionnaire_complete ? "yes" : "no"} onChange={(e) => updateField("static_questionnaire_complete", e.target.value === "yes")} style={formInputStyle}>
+              <option value="yes">Yes</option>
+              <option value="no">No</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
+      {/* GIT block */}
+      <div style={{ border: "1.5px solid #14213D", borderRadius: "8px", padding: "18px", marginBottom: "24px" }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.72rem", color: "#14213D", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "14px" }}>
+          GIT Quoting inputs
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginBottom: "16px" }}>
+          <FormField label="Load limit per vehicle (R)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.load_limit_per_vehicle}
+              onChange={(e) => {
+                const value = Number(e.target.value);
+                setSaved(false);
+                setForm((f) => ({
+                  ...f,
+                  load_limit_per_vehicle: value,
+                  // Frans-confirmed R1m RMP-1 threshold -- auto-suggested,
+                  // not forced: does not un-tick if the user already
+                  // ticked it manually, and can still be unticked by hand.
+                  is_rmp1_scoped: value > GIT_RMP1_THRESHOLD_RAND ? true : f.is_rmp1_scoped,
+                }));
+              }}
+              onWheel={(e) => e.target.blur()}
+              step="50000"
+              style={formInputStyle}
+            />
+          </FormField>
+          {form.load_limit_per_vehicle > GIT_RMP1_THRESHOLD_RAND && (
+            <div style={{ fontSize: "0.78rem", color: "#B5762A", gridColumn: "1 / -1" }}>
+              Load limit exceeds R{GIT_RMP1_THRESHOLD_RAND.toLocaleString()} -- "RMP1-scoped fleet" auto-ticked below (Frans-confirmed threshold). Untick if not applicable.
+            </div>
+          )}
+          <FormField label="Commodity type (GIT)">
+            <select value={form.commodity_type} onChange={(e) => updateField("commodity_type", e.target.value)} style={formInputStyle}>
+              {GIT_ALL_COMMODITY_OPTIONS.map((key) => (
+                <option key={key} value={key}>
+                  {key.replace(/_/g, " ")}
+                  {GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL.has(key) ? " (referral only)" : ""}
+                </option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Geographic zone (GIT)">
+            <select value={form.geographic_zone} onChange={(e) => updateField("geographic_zone", e.target.value)} style={formInputStyle}>
+              <option value="western_cape">Western Cape</option>
+              <option value="medium_risk">Medium risk</option>
+              <option value="gauteng_high_risk">Gauteng high risk</option>
+            </select>
+          </FormField>
+          <FormField label="Claims history">
+            <select value={form.claims_history} onChange={(e) => updateField("claims_history", e.target.value)} style={formInputStyle}>
+              <option value="clean">Clean</option>
+              <option value="one_claim">One claim</option>
+            </select>
+          </FormField>
+          <FormField label="Loss ratio % (if known)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.loss_ratio_pct ?? ""} onChange={(e) => updateField("loss_ratio_pct", e.target.value === "" ? null : Number(e.target.value))} onWheel={(e) => e.target.blur()} placeholder="e.g. 42.5" style={formInputStyle} />
+          </FormField>
+          <FormField label="Cover type">
+            <select value={form.cover_type} onChange={(e) => updateField("cover_type", e.target.value)} style={formInputStyle}>
+              <option value="all_risks">All Risks</option>
+              <option value="fire_collision_overturning_theft_hijack">Restricted - Fire/Collision/Overturning/Theft-Hijack (80%)</option>
+              <option value="fire_collision_overturning_only">Restricted - Fire/Collision/Overturning only (75%)</option>
+            </select>
+          </FormField>
+        </div>
+
+        <div style={{ marginBottom: "16px" }}>
+          <SectionLabel>IoT devices fitted (GIT)</SectionLabel>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "6px", marginTop: "10px" }}>
+            {Object.keys(GIT_IOT_CREDITS).map((device) => (
+              <label key={device} style={checkboxLabelStyle}>
+                <input type="checkbox" checked={form.iot_devices_fitted.includes(device)} onChange={() => toggleIotDevice(device)} />
+                {device.replace(/_/g, " ")}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <SectionLabel>Security &amp; scope (GIT)</SectionLabel>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "10px", marginBottom: "12px" }}>
+            <label style={checkboxLabelStyle}>
+              <input type="checkbox" checked={form.is_high_value_cargo} onChange={(e) => updateField("is_high_value_cargo", e.target.checked)} />
+              High-value cargo
+            </label>
+            <label style={checkboxLabelStyle}>
+              <input type="checkbox" checked={form.is_rmp1_scoped} onChange={(e) => updateField("is_rmp1_scoped", e.target.checked)} />
+              RMP1-scoped fleet
+            </label>
+            <label style={checkboxLabelStyle}>
+              <input type="checkbox" checked={form.cargosnap_fitted} onChange={(e) => updateField("cargosnap_fitted", e.target.checked)} />
+              Cargosnap fitted
+            </label>
+          </div>
+          <FormField label="Security device fitted (CV+TS+CPI)">
+            <select value={form.cvtscpi_rmp_tier} onChange={(e) => updateField("cvtscpi_rmp_tier", e.target.value)} style={formInputStyle}>
+              <option value="none">None fitted</option>
+              <option value="rmp1_top_lock">RMP1 - Top Lock</option>
+              <option value="rmp2_cable_lock">RMP2 - Cable Lock</option>
+              <option value="rmp3_tracktag">RMP3 - TrackTag</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
+      <button
+        className="tx-btn"
+        onClick={handleSave}
+        style={{
+          background: "#14213D",
+          color: "#FAF7F0",
+          border: "none",
+          borderRadius: "5px",
+          padding: "10px 20px",
+          fontSize: "0.9rem",
+          fontWeight: 600,
+          cursor: "pointer",
+          fontFamily: "'Inter', sans-serif",
+        }}
+      >
+        Save fleet information
+      </button>
+      {saved && (
+        <div style={{ marginTop: "12px", fontSize: "0.82rem", color: "#3D6B4F" }}>
+          Saved. Open HCV Rating or GIT Quoting — both will start pre-filled from this.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+const EXTRACTION_PROMPT = `You are a data extraction tool. You will be shown a PDF that is one of two document types used by a South African HCV/GIT insurance underwriter:
+
+TYPE A: An RMS/LibroAssist "Transporter Risk Report" — a telematics/i-Cab risk report with monthly graphs and tables of driver behaviour scores.
+TYPE B: An insurer policy schedule with GIT cover limits, premiums, and vehicle lists.
+
+Extract ONLY what is explicitly stated in the document. Do not infer, average, or estimate any number that is not directly printed or clearly readable from a labelled data table. If a value is only visible on a graph without an accompanying printed number, set it to null and note it in "low_confidence_fields" rather than guessing.
+
+CRITICAL: Never place a raw incident count into a "_score" field, or vice versa. If a page only shows a 0-100 risk score with no exact number, the score field is null. If a page separately shows a raw count table, use the matching "_count" field instead. These are never interchangeable.
+
+CRITICAL FOR POLICY SCHEDULES: These documents often contain MULTIPLE candidate numbers for what looks like the same field (e.g. a GIT-section premium subtotal AND a whole-policy total premium; a GIT-covered vehicle count AND a full motor asset register count including trailers). Never collapse these into one ambiguous field. Always populate BOTH the GIT-specific figure and the whole-policy total figure separately, clearly labelled, so nothing is lost or guessed at.
+
+Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
+{
+  "document_type": "RMS_REPORT" or "POLICY_SCHEDULE",
+  "transporter_or_insured_name": string,
+  "report_or_schedule_date": string,
+  "period_reviewed": string or null,
+  "fleet_summary": {
+    "avg_vehicles": number or null,
+    "avg_km_per_vehicle_month": number or null,
+    "combined_risk_score_latest": number or null
+  },
+  "monthly_data": [
+    {
+      "month": "YYYY-MM",
+      "combined_score_reported": number or null,
+      "distance_index": number or null,
+      "speeding": number or null,
+      "fatigue_hos": number or null,
+      "device_covered_count": number or null
+    }
+  ],
+  "static_risk": { "score": number or null, "note": string or null },
+  "policy_details": {
+    "insurer": string or null,
+    "policy_number": string or null,
+    "git_limit_per_vehicle": number or null,
+    "git_section_vehicle_count": number or null,
+    "git_section_premium": number or null,
+    "total_policy_vehicle_count": number or null,
+    "total_policy_premium": number or null,
+    "pvpm_rate": number or null
+  },
+  "low_confidence_fields": [string],
+  "extraction_notes": string
+}`;
+
+const VERDICT_STYLES = {
+  ACCEPT: { ink: "#3D6B4F", label: "ACCEPT" },
+  DECLINE: { ink: "#B23A2E", label: "DECLINE" },
+  REFER: { ink: "#B5762A", label: "REFER" },
+  "CONDITIONAL ACCEPT": { ink: "#B5762A", label: "CONDITIONAL ACCEPT" },
+  "INSUFFICIENT DATA": { ink: "#5C6570", label: "INSUFFICIENT DATA" },
+  QUOTABLE: { ink: "#3D6B4F", label: "QUOTABLE" },
+  "CANNOT BIND": { ink: "#B23A2E", label: "CANNOT BIND" },
+};
+
+function StampBadge({ verdict }) {
+  const style = VERDICT_STYLES[verdict] || VERDICT_STYLES["INSUFFICIENT DATA"];
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        border: `4px solid ${style.ink}`,
+        color: style.ink,
+        borderRadius: "6px",
+        padding: "14px 28px",
+        transform: "rotate(-3deg)",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontWeight: 700,
+        fontSize: "1.5rem",
+        letterSpacing: "0.12em",
+        textTransform: "uppercase",
+        boxShadow: `inset 0 0 0 1px ${style.ink}`,
+        background: "rgba(255,255,255,0.4)",
+      }}
+    >
+      {style.label}
+    </div>
+  );
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function TelematixRater() {
+  const [status, setStatus] = useState("idle"); // idle | reading | extracting | done | error
+  const [mode, setMode] = useState("hcv"); // hcv | hcv_rating | git | fleet_info
+  const [sharedFleetInfo, setSharedFleetInfo] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [extracted, setExtracted] = useState(null);
+  const [result, setResult] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
+  const inputRef = useRef(null);
+
+  const processFile = useCallback(async (file) => {
+    if (!file || !(file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
+      setStatus("error");
+      setErrorMsg("Please provide a PDF file — that's the only format this reads.");
+      return;
+    }
+    setFileName(file.name);
+    setStatus("reading");
+    setExtracted(null);
+    setResult(null);
+    setErrorMsg(null);
+
+    try {
+      const b64 = await fileToBase64(file);
+      setStatus("extracting");
+
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 8000,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+                { type: "text", text: EXTRACTION_PROMPT },
+              ],
+            },
+          ],
+        }),
+      });
+
+      const data = await response.json();
+      let rawText = (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("");
+      rawText = rawText.trim();
+      if (rawText.startsWith("```")) {
+        rawText = rawText.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+      }
+
+      const json = JSON.parse(rawText);
+      setExtracted(json);
+
+      if (json.document_type === "POLICY_SCHEDULE") {
+        setResult({ policySchedule: true });
+      } else {
+        setResult(scoreFleet(json));
+      }
+      setStatus("done");
+    } catch (err) {
+      setStatus("error");
+      setErrorMsg(err.message || "Extraction failed. Try again, or try a smaller/clearer PDF.");
+    }
+  }, []);
+
+  const onDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      setDragOver(false);
+      const file = e.dataTransfer.files?.[0];
+      processFile(file);
+    },
+    [processFile]
+  );
+
+  const reset = () => {
+    setStatus("idle");
+    setFileName(null);
+    setExtracted(null);
+    setResult(null);
+    setErrorMsg(null);
+    setShowRaw(false);
+  };
+
+  return (
+    <div
+      style={{
+        fontFamily: "'Inter', -apple-system, sans-serif",
+        background: "#FAF7F0",
+        color: "#14213D",
+        minHeight: "100%",
+        padding: "0",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;700&family=Fraunces:wght@600;700&display=swap');
+        .tx-root * { box-sizing: border-box; }
+        .tx-upload-zone:focus-visible { outline: 2px solid #14213D; outline-offset: 3px; }
+        .tx-btn:focus-visible { outline: 2px solid #14213D; outline-offset: 2px; }
+        @media (prefers-reduced-motion: reduce) {
+          .tx-root * { transition: none !important; animation: none !important; }
+        }
+      `}</style>
+
+      <div className="tx-root" style={{ maxWidth: "760px", margin: "0 auto", padding: "40px 24px 64px" }}>
+        {/* Header */}
+        <div style={{ marginBottom: "36px", borderBottom: "2px solid #14213D", paddingBottom: "20px" }}>
+          <div
+            style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: "0.75rem",
+              letterSpacing: "0.15em",
+              color: "#B5762A",
+              textTransform: "uppercase",
+              marginBottom: "6px",
+            }}
+          >
+            TelematiX — Stream 2 Virtual Underwriter
+          </div>
+          <h1
+            style={{
+              fontFamily: "'Fraunces', serif",
+              fontSize: "1.9rem",
+              fontWeight: 700,
+              margin: 0,
+              lineHeight: 1.15,
+            }}
+          >
+            HCV / GIT Fleet Risk Rater
+          </h1>
+          <p style={{ color: "#5C6570", fontSize: "0.95rem", marginTop: "8px", marginBottom: 0 }}>
+            Upload a document or enter fleet details manually across HCV risk scoring, HCV rating, and GIT quoting —
+            extraction and scoring always run separately, the rating is never guessed by the model.
+          </p>
+        </div>
+
+        {/* Mode tabs */}
+        <div style={{ display: "flex", gap: "8px", marginBottom: "28px", flexWrap: "wrap" }}>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("hcv")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "hcv" ? "#14213D" : "transparent",
+              color: mode === "hcv" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            Telematix Report
+          </button>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("hcv_rating")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "hcv_rating" ? "#14213D" : "transparent",
+              color: mode === "hcv_rating" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            HCV Rating
+          </button>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("git")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "git" ? "#14213D" : "transparent",
+              color: mode === "git" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            GIT Quoting
+          </button>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("fleet_info")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "fleet_info" ? "#14213D" : "transparent",
+              color: mode === "fleet_info" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            Fleet Information
+          </button>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("multi_cohort")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "multi_cohort" ? "#14213D" : "transparent",
+              color: mode === "multi_cohort" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            Multi-Cohort
+          </button>
+        </div>
+
+        {mode === "multi_cohort" ? (
+          <MultiCohortView sharedFleetInfo={sharedFleetInfo} />
+        ) : mode === "git" ? (
+          <GitQuotingView sharedFleetInfo={sharedFleetInfo} />
+        ) : mode === "hcv_rating" ? (
+          <HcvRatingView sharedFleetInfo={sharedFleetInfo} />
+        ) : mode === "fleet_info" ? (
+          <FleetInformationView sharedFleetInfo={sharedFleetInfo} onSave={setSharedFleetInfo} />
+        ) : (
+          <>
+        {/* Upload zone */}
+        {status === "idle" || status === "error" ? (
+          <div
+            className="tx-upload-zone"
+            role="button"
+            tabIndex={0}
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(e) => e.key === "Enter" && inputRef.current?.click()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}
+            style={{
+              border: `2px dashed ${dragOver ? "#B5762A" : "#14213D"}`,
+              borderRadius: "8px",
+              padding: "56px 24px",
+              textAlign: "center",
+              cursor: "pointer",
+              background: dragOver ? "rgba(181,118,42,0.06)" : "transparent",
+              transition: "all 0.15s ease",
+            }}
+          >
+            <div style={{ fontSize: "2rem", marginBottom: "10px" }}>📄</div>
+            <div style={{ fontWeight: 600, fontSize: "1.05rem" }}>
+              Drop a PDF here, or click to choose one
+            </div>
+            <div style={{ color: "#5C6570", fontSize: "0.85rem", marginTop: "6px" }}>
+              RMS transporter risk report or insurer GIT policy schedule
+            </div>
+            <input
+              ref={inputRef}
+              type="file"
+              accept="application/pdf"
+              style={{ display: "none" }}
+              onChange={(e) => processFile(e.target.files?.[0])}
+            />
+            {status === "error" && (
+              <div
+                style={{
+                  marginTop: "20px",
+                  color: "#B23A2E",
+                  fontSize: "0.9rem",
+                  fontFamily: "'IBM Plex Mono', monospace",
+                }}
+              >
+                {errorMsg}
+              </div>
+            )}
+          </div>
+        ) : null}
+
+        {/* Loading state */}
+        {(status === "reading" || status === "extracting") && (
+          <div style={{ textAlign: "center", padding: "48px 0" }}>
+            <div
+              style={{
+                width: "36px",
+                height: "36px",
+                margin: "0 auto 18px",
+                border: "3px solid #E4DCC9",
+                borderTopColor: "#B5762A",
+                borderRadius: "50%",
+                animation: "spin 0.8s linear infinite",
+              }}
+            />
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.85rem", color: "#5C6570" }}>
+              {status === "reading" ? "Reading " + fileName : "Extracting from document — this can take a minute on long schedules..."}
+            </div>
+          </div>
+        )}
+
+        {/* Results */}
+        {status === "done" && result && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "24px" }}>
+              <div>
+                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.75rem", color: "#5C6570", marginBottom: "4px" }}>
+                  {fileName}
+                </div>
+                <div style={{ fontSize: "1.1rem", fontWeight: 600 }}>
+                  {extracted?.transporter_or_insured_name || "Unknown"}
+                </div>
+              </div>
+              <button className="tx-btn" onClick={reset} style={resetBtnStyle}>
+                Rate another
+              </button>
+            </div>
+
+            {result.policySchedule ? (
+              <PolicyScheduleView extracted={extracted} />
+            ) : (
+              <FleetVerdictView extracted={extracted} result={result} />
+            )}
+
+            <button
+              className="tx-btn"
+              onClick={() => setShowRaw((s) => !s)}
+              style={{ ...resetBtnStyle, marginTop: "28px", fontSize: "0.8rem" }}
+            >
+              {showRaw ? "Hide raw extraction JSON" : "Show raw extraction JSON"}
+            </button>
+            {showRaw && (
+              <pre
+                style={{
+                  marginTop: "12px",
+                  background: "#14213D",
+                  color: "#E4DCC9",
+                  padding: "16px",
+                  borderRadius: "6px",
+                  fontSize: "0.72rem",
+                  overflowX: "auto",
+                  fontFamily: "'IBM Plex Mono', monospace",
+                }}
+              >
+                {JSON.stringify(extracted, null, 2)}
+              </pre>
+            )}
+          </div>
+        )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const tabBtnStyle = {
+  border: "1.5px solid #14213D",
+  borderRadius: "5px",
+  padding: "8px 16px",
+  fontSize: "0.85rem",
+  fontWeight: 600,
+  cursor: "pointer",
+  fontFamily: "'Inter', sans-serif",
+};
+
+function GitQuotingView({ sharedFleetInfo }) {
+  const [form, setForm] = useState(() =>
+    makeGitFleetInput(
+      sharedFleetInfo
+        ? {
+            fleet_name: sharedFleetInfo.fleet_name,
+            vehicle_count: sharedFleetInfo.vehicle_count,
+            load_limit_per_vehicle: sharedFleetInfo.load_limit_per_vehicle,
+            commodity_type: sharedFleetInfo.commodity_type,
+            geographic_zone: sharedFleetInfo.geographic_zone,
+            claims_history: sharedFleetInfo.claims_history,
+            loss_ratio_pct: sharedFleetInfo.loss_ratio_pct,
+            cover_type: sharedFleetInfo.cover_type,
+            iot_devices_fitted: sharedFleetInfo.iot_devices_fitted,
+            cargosnap_fitted: sharedFleetInfo.cargosnap_fitted,
+            cvtscpi_rmp_tier: sharedFleetInfo.cvtscpi_rmp_tier,
+            is_high_value_cargo: sharedFleetInfo.is_high_value_cargo,
+            is_rmp1_scoped: sharedFleetInfo.is_rmp1_scoped,
+          }
+        : {}
+    )
+  );
+  const [selected, setSelected] = useState(null);
+  const [result, setResult] = useState(null);
+  const [overrideApproverName, setOverrideApproverName] = useState("");
+  const [overrideReasonText, setOverrideReasonText] = useState("");
+  const [manualFactorInput, setManualFactorInput] = useState("");
+
+  const loadPreset = (scenario) => {
+    setSelected(scenario.label);
+    setForm(scenario.input);
+    setResult(null);
+    setOverrideApproverName("");
+    setOverrideReasonText("");
+    setManualFactorInput("");
+  };
+
+  const updateField = (key, value) => {
+    setSelected(null);
+    setForm((f) => ({ ...f, [key]: value }));
+  };
+
+  const toggleIotDevice = (device) => {
+    setSelected(null);
+    setForm((f) => {
+      const has = f.iot_devices_fitted.includes(device);
+      return {
+        ...f,
+        iot_devices_fitted: has
+          ? f.iot_devices_fitted.filter((d) => d !== device)
+          : [...f.iot_devices_fitted, device],
+      };
+    });
+  };
+
+  const computeQuote = () => {
+    setOverrideApproverName("");
+    setOverrideReasonText("");
+    setManualFactorInput("");
+    setResult(computeGitPvpm(form));
+  };
+
+  const isExcludedCommodity = GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL.has(form.commodity_type);
+  const overrideReady =
+    overrideApproverName.trim() !== "" &&
+    overrideReasonText.trim() !== "" &&
+    (!isExcludedCommodity || manualFactorInput !== "");
+
+  const applyOverride = () => {
+    const factorNum = manualFactorInput === "" ? null : Number(manualFactorInput);
+    const formWithFactor = { ...form, manual_commodity_factor: factorNum };
+    setResult(computeGitPvpm(formWithFactor, { approverName: overrideApproverName.trim(), reason: overrideReasonText.trim() }));
+  };
+
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: "0.75rem",
+          color: "#B5762A",
+          marginBottom: "16px",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+        }}
+      >
+        GIT Quoting
+      </div>
+
+      <div style={{ marginBottom: "18px" }}>
+        <SectionLabel>Quick-fill benchmark scenarios</SectionLabel>
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
+          {GIT_BENCHMARK_SCENARIOS.map((scenario) => (
+            <button
+              key={scenario.label}
+              className="tx-btn"
+              onClick={() => loadPreset(scenario)}
+              style={{
+                ...tabBtnStyle,
+                textAlign: "left",
+                background: selected === scenario.label ? "rgba(181,118,42,0.1)" : "transparent",
+                borderColor: selected === scenario.label ? "#B5762A" : "#14213D",
+              }}
+            >
+              {scenario.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Fleet details</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
+          <FormField label="Fleet name">
+            <input
+              type="text"
+              value={form.fleet_name}
+              onChange={(e) => updateField("fleet_name", e.target.value)}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Vehicle count">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.vehicle_count}
+              onChange={(e) => updateField("vehicle_count", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Load limit per vehicle (R)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.load_limit_per_vehicle}
+              onChange={(e) => updateField("load_limit_per_vehicle", Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              step="50000"
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Commodity type">
+            <select
+              value={form.commodity_type}
+              onChange={(e) => updateField("commodity_type", e.target.value)}
+              style={formInputStyle}
+            >
+              {GIT_ALL_COMMODITY_OPTIONS.map((key) => (
+                <option key={key} value={key}>
+                  {key.replace(/_/g, " ")}
+                  {GIT_EXCLUDED_COMMODITIES_REQUIRE_REFERRAL.has(key) ? " (referral only)" : ""}
+                </option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label="Geographic zone">
+            <select
+              value={form.geographic_zone}
+              onChange={(e) => updateField("geographic_zone", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="western_cape">Western Cape</option>
+              <option value="medium_risk">Medium risk</option>
+              <option value="gauteng_high_risk">Gauteng high risk</option>
+            </select>
+          </FormField>
+          <FormField label="Claims history">
+            <select
+              value={form.claims_history}
+              onChange={(e) => updateField("claims_history", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="clean">Clean</option>
+              <option value="one_claim">One claim</option>
+            </select>
+          </FormField>
+          <FormField label="Loss ratio % (if known)">
+            <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              value={form.loss_ratio_pct ?? ""}
+              onChange={(e) => updateField("loss_ratio_pct", e.target.value === "" ? null : Number(e.target.value))}
+              onWheel={(e) => e.target.blur()}
+              placeholder="e.g. 42.5"
+              style={formInputStyle}
+            />
+          </FormField>
+          <FormField label="Cover type">
+            <select
+              value={form.cover_type}
+              onChange={(e) => updateField("cover_type", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="all_risks">All Risks</option>
+              <option value="fire_collision_overturning_theft_hijack">
+                Restricted - Fire/Collision/Overturning/Theft-Hijack (80%)
+              </option>
+              <option value="fire_collision_overturning_only">
+                Restricted - Fire/Collision/Overturning only (75%)
+              </option>
+            </select>
+          </FormField>
+          <FormField label="Fleet age">
+            <select
+              value={form.fleet_age}
+              onChange={(e) => updateField("fleet_age", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="new">New</option>
+              <option value="over_10yr">Over 10 years</option>
+            </select>
+          </FormField>
+          <FormField label="Night ops">
+            <select
+              value={form.night_ops}
+              onChange={(e) => updateField("night_ops", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="under_30pct">Under 30%</option>
+              <option value="over_30pct">Over 30%</option>
+            </select>
+          </FormField>
+          <FormField label="Cross-border">
+            <select
+              value={form.cross_border}
+              onChange={(e) => updateField("cross_border", e.target.value)}
+              style={formInputStyle}
+            >
+              <option value="local">Local</option>
+              <option value="sadc">SADC</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>IoT devices fitted</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "6px", marginTop: "10px" }}>
+          {Object.keys(GIT_IOT_CREDITS).map((device) => (
+            <label key={device} style={checkboxLabelStyle}>
+              <input
+                type="checkbox"
+                checked={form.iot_devices_fitted.includes(device)}
+                onChange={() => toggleIotDevice(device)}
+              />
+              {device.replace(/_/g, " ")}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "24px" }}>
+        <SectionLabel>Security &amp; scope</SectionLabel>
+        <div style={{ fontSize: "0.78rem", color: "#5C6570", marginTop: "10px", marginBottom: "12px", lineHeight: 1.5 }}>
+          If both "High-value cargo" and "RMP1-scoped fleet" are checked, cover cannot bind unless a security device is selected below.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "16px" }}>
+          <label style={checkboxLabelStyle}>
+            <input
+              type="checkbox"
+              checked={form.is_high_value_cargo}
+              onChange={(e) => updateField("is_high_value_cargo", e.target.checked)}
+            />
+            High-value cargo
+          </label>
+          <label style={checkboxLabelStyle}>
+            <input
+              type="checkbox"
+              checked={form.is_rmp1_scoped}
+              onChange={(e) => updateField("is_rmp1_scoped", e.target.checked)}
+            />
+            RMP1-scoped fleet (mandatory security requirement applies)
+          </label>
+          <label style={checkboxLabelStyle}>
+            <input
+              type="checkbox"
+              checked={form.cargosnap_fitted}
+              onChange={(e) => updateField("cargosnap_fitted", e.target.checked)}
+            />
+            Cargosnap fitted
+          </label>
+        </div>
+        <FormField label="Security device fitted (CV+TS+CPI)">
+          <select
+            value={form.cvtscpi_rmp_tier}
+            onChange={(e) => updateField("cvtscpi_rmp_tier", e.target.value)}
+            style={formInputStyle}
+          >
+            <option value="none">None fitted</option>
+            <option value="rmp1_top_lock">RMP1 - Top Lock</option>
+            <option value="rmp2_cable_lock">RMP2 - Cable Lock</option>
+            <option value="rmp3_tracktag">RMP3 - TrackTag</option>
+          </select>
+        </FormField>
+      </div>
+
+      <button
+        className="tx-btn"
+        onClick={computeQuote}
+        style={{
+          background: "#14213D",
+          color: "#FAF7F0",
+          border: "none",
+          borderRadius: "5px",
+          padding: "10px 20px",
+          fontSize: "0.9rem",
+          fontWeight: 600,
+          cursor: "pointer",
+          fontFamily: "'Inter', sans-serif",
+          marginBottom: "24px",
+        }}
+      >
+        Compute quote
+      </button>
+
+      {result && !result.error && result.verdict === "REFER" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "20px" }}>
+            <StampBadge verdict="REFER" />
+            <div>
+              <div style={{ fontSize: "0.95rem", fontWeight: 600, color: "#14213D", lineHeight: 1.4 }}>
+                {(result.referral_reasons && result.referral_reasons[0]) || "Requires management review"}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#5C6570", marginTop: "2px" }}>
+                Refer to management — no premium calculated
+              </div>
+            </div>
+          </div>
+          {(result.referral_reasons || []).length > 1 && (
+            <div style={{ marginTop: "16px" }}>
+              <SectionLabel>All referral reasons</SectionLabel>
+              <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+                {result.referral_reasons.map((reason, i) => (
+                  <li key={i}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div style={{ marginTop: "20px", borderTop: "1px solid #E4DCC9", paddingTop: "16px" }}>
+            <SectionLabel>Management override</SectionLabel>
+            <div style={{ fontSize: "0.78rem", color: "#5C6570", marginTop: "8px", marginBottom: "12px", lineHeight: 1.5 }}>
+              If management has reviewed and approved this fleet despite the referral, enter details below to compute a quote.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginBottom: "12px" }}>
+              <FormField label="Approved by">
+                <input
+                  type="text"
+                  value={overrideApproverName}
+                  onChange={(e) => setOverrideApproverName(e.target.value)}
+                  style={formInputStyle}
+                />
+              </FormField>
+              {isExcludedCommodity && (
+                <FormField label="Manual loading factor">
+                  <input
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                    type="number"
+                    step="0.01"
+                    value={manualFactorInput}
+                    onChange={(e) => setManualFactorInput(e.target.value)}
+                    onWheel={(e) => e.target.blur()}
+                    placeholder="e.g. 2.50"
+                    style={formInputStyle}
+                  />
+                </FormField>
+              )}
+            </div>
+            <FormField label="Reason for override">
+              <input
+                type="text"
+                value={overrideReasonText}
+                onChange={(e) => setOverrideReasonText(e.target.value)}
+                placeholder="Why is this approved despite the referral?"
+                style={formInputStyle}
+              />
+            </FormField>
+            <button
+              className="tx-btn"
+              onClick={applyOverride}
+              disabled={!overrideReady}
+              style={{
+                marginTop: "14px",
+                background: overrideReady ? "#14213D" : "#C9C2B2",
+                color: "#FAF7F0",
+                border: "none",
+                borderRadius: "5px",
+                padding: "10px 20px",
+                fontSize: "0.9rem",
+                fontWeight: 600,
+                cursor: overrideReady ? "pointer" : "not-allowed",
+                fontFamily: "'Inter', sans-serif",
+              }}
+            >
+              Override and compute quote
+            </button>
+          </div>
+        </div>
+      )}
+
+      {result && !result.error && result.verdict !== "REFER" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "24px" }}>
+            <StampBadge verdict={result.verdict.startsWith("QUOTABLE") ? "QUOTABLE" : "CANNOT BIND"} />
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "1.4rem", fontWeight: 700 }}>
+                {result.total_monthly_premium != null ? "R" + result.total_monthly_premium.toLocaleString() : "\u2014"}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#5C6570" }}>Total monthly premium</div>
+            </div>
+          </div>
+
+          {result.override_applied && (
+            <div style={{ background: "#FCEFDD", border: "1px solid #B5762A", borderRadius: "6px", padding: "14px 16px", marginBottom: "20px" }}>
+              <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#14213D" }}>
+                Management override applied
+              </div>
+              <div style={{ fontSize: "0.82rem", color: "#5C6570", marginTop: "4px" }}>
+                Approved by {result.override_approver_name}: {result.override_reason}
+              </div>
+              <div style={{ fontSize: "0.78rem", color: "#5C6570", marginTop: "6px" }}>
+                Original referral reason(s): {(result.bypassed_referral_reasons || []).join("; ")}
+              </div>
+              {result.manual_factor_used && (
+                <div style={{ fontSize: "0.78rem", color: "#5C6570", marginTop: "4px" }}>
+                  Priced using manually entered loading factor: {result.commodity_factor_applied}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ background: "#F1ECE0", borderRadius: "6px", padding: "16px 18px", marginBottom: "20px" }}>
+            <div style={{ fontSize: "0.9rem", lineHeight: 1.5 }}>{result.verdict}</div>
+            <div style={{ fontSize: "0.82rem", color: "#5C6570", marginTop: "6px" }}>
+              {result.mandatory_security.note}
+            </div>
+            {result.min_premium_applied && (
+              <div style={{ fontSize: "0.82rem", color: "#B5762A", marginTop: "6px" }}>
+                Minimum annual premium floor (R5,000) applied - calculated premium was below the floor.
+              </div>
+            )}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px", marginBottom: "22px" }}>
+            <StatBox label="Base PVPM" value={"R" + result.base_pvpm.toLocaleString()} />
+            <StatBox label="Loaded PVPM" value={"R" + result.loaded_pvpm.toLocaleString()} />
+            <StatBox label="Final PVPM" value={"R" + result.final_pvpm.toLocaleString()} />
+            <StatBox label="Vehicle count" value={result.vehicle_count} />
+            <StatBox label="Annual premium" value={result.annual_premium != null ? "R" + result.annual_premium.toLocaleString() : "\u2014"} />
+            <StatBox label="IoT credit" value={(result.iot_credit.total_credit * 100).toFixed(0) + "%"} />
+          </div>
+
+          {Array.isArray(result.iot_credit.detail) && result.iot_credit.detail.length > 0 && (
+            <div>
+              <SectionLabel>Credit breakdown</SectionLabel>
+              <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+                {result.iot_credit.detail.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {typeof result.iot_credit.detail === "string" && (
+            <div style={{ fontSize: "0.82rem", color: "#5C6570" }}>{result.iot_credit.detail}</div>
+          )}
+        </div>
+      )}
+      {result && result.error && (
+        <div style={{ color: "#B23A2E", fontSize: "0.85rem", fontFamily: "'IBM Plex Mono', monospace" }}>
+          {result.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FormField({ label, children }) {
+  return (
+    <div>
+      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+const formInputStyle = {
+  width: "100%",
+  padding: "8px 10px",
+  fontSize: "0.85rem",
+  fontFamily: "'Inter', sans-serif",
+  border: "1.5px solid #14213D",
+  borderRadius: "5px",
+  background: "#FAF7F0",
+  color: "#14213D",
+};
+
+const checkboxLabelStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  fontSize: "0.82rem",
+  color: "#14213D",
+  cursor: "pointer",
+};
+const resetBtnStyle = {
+  background: "transparent",
+  border: "1.5px solid #14213D",
+  color: "#14213D",
+  borderRadius: "5px",
+  padding: "8px 16px",
+  fontSize: "0.85rem",
+  fontWeight: 500,
+  cursor: "pointer",
+  fontFamily: "'Inter', sans-serif",
+};
+
+function FleetVerdictView({ extracted, result }) {
+  const fs = extracted.fleet_summary || {};
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "24px" }}>
+        <StampBadge verdict={result.verdict} />
+        <div>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "1.4rem", fontWeight: 700 }}>
+            {result.latest.combined_score_used != null ? result.latest.combined_score_used.toFixed(0) : "—"}
+          </div>
+          <div style={{ fontSize: "0.75rem", color: "#5C6570" }}>Latest combined score</div>
+        </div>
+      </div>
+
+      <div style={{ background: "#F1ECE0", borderRadius: "6px", padding: "16px 18px", marginBottom: "20px" }}>
+        <div style={{ fontSize: "0.9rem", lineHeight: 1.5 }}>{result.detail}</div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px", marginBottom: "22px" }}>
+        <StatBox label="Avg vehicles" value={fs.avg_vehicles ?? "—"} />
+        <StatBox label="Avg km/vehicle/mo" value={fs.avg_km_per_vehicle_month ?? "—"} />
+        <StatBox label="Static risk score" value={extracted.static_risk?.score != null ? extracted.static_risk.score : "—"} />
+      </div>
+      {extracted.static_risk?.note && (
+        <div style={{ fontSize: "0.78rem", color: "#5C6570", marginTop: "-14px", marginBottom: "20px", lineHeight: 1.5 }}>
+          Static risk note: {extracted.static_risk.note}
+        </div>
+      )}
+
+      {extracted.low_confidence_fields?.length > 0 && (
+        <div style={{ marginBottom: "20px" }}>
+          <SectionLabel>Fields not verifiable from this document</SectionLabel>
+          <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+            {extracted.low_confidence_fields.map((f, i) => (
+              <li key={i}>{f}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {extracted.monthly_data?.length > 0 && (
+        <div>
+          <SectionLabel>Monthly audit trail</SectionLabel>
+          <div style={{ overflowX: "auto", marginTop: "8px" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
+              <thead>
+                <tr style={{ borderBottom: "1.5px solid #14213D" }}>
+                  <th style={thStyle}>Month</th>
+                  <th style={thStyle}>Combined score</th>
+                  <th style={thStyle}>Triggers</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.monthlyResults.map((m, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid #E4DCC9" }}>
+                    <td style={tdStyle}>{m.month || `#${i + 1}`}</td>
+                    <td style={{ ...tdStyle, fontFamily: "'IBM Plex Mono', monospace" }}>
+                      {m.combined_score_used != null ? m.combined_score_used.toFixed(0) : "—"}
+                    </td>
+                    <td style={{ ...tdStyle, color: m.triggers.length ? "#B23A2E" : "#5C6570" }}>
+                      {m.triggers.length ? m.triggers.join("; ") : "clean"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PolicyScheduleView({ extracted }) {
+  const p = extracted.policy_details || {};
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: "0.75rem",
+          color: "#B5762A",
+          marginBottom: "16px",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+        }}
+      >
+        Policy schedule — not scored
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px" }}>
+        <StatBox label="Insurer" value={p.insurer ?? "—"} />
+        <StatBox label="Policy number" value={p.policy_number ?? "—"} />
+        <StatBox label="GIT limit / vehicle" value={p.git_limit_per_vehicle ? `R${p.git_limit_per_vehicle.toLocaleString()}` : "—"} />
+        <StatBox label="PVPM rate" value={p.pvpm_rate ? `R${p.pvpm_rate.toFixed(2)}` : "—"} />
+        <StatBox label="GIT section — vehicles" value={p.git_section_vehicle_count ?? "—"} />
+        <StatBox label="GIT section — premium" value={p.git_section_premium ? `R${p.git_section_premium.toLocaleString()}` : "—"} />
+        <StatBox label="Total policy — vehicles" value={p.total_policy_vehicle_count ?? "—"} />
+        <StatBox label="Total policy — premium" value={p.total_policy_premium ? `R${p.total_policy_premium.toLocaleString()}` : "—"} />
+      </div>
+    </div>
+  );
+}
+
+function StatBox({ label, value }) {
+  return (
+    <div style={{ background: "#F1ECE0", borderRadius: "6px", padding: "12px 14px" }}>
+      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>{label}</div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.95rem", fontWeight: 600 }}>{value}</div>
+    </div>
+  );
+}
+
+function SectionLabel({ children }) {
+  return (
+    <div
+      style={{
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: "0.72rem",
+        letterSpacing: "0.08em",
+        textTransform: "uppercase",
+        color: "#14213D",
+        borderBottom: "1.5px solid #14213D",
+        paddingBottom: "4px",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const thStyle = { textAlign: "left", padding: "8px 10px", fontWeight: 600, color: "#14213D" };
+const tdStyle = { padding: "8px 10px" };
