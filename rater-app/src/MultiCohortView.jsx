@@ -478,6 +478,22 @@ export default function MultiCohortView({ sharedFleetInfo }) {
         </div>
       </div>
 
+      {fleetSummary.quotableCount > 0 && (
+        <div style={{ textAlign: "right", marginBottom: "12px" }}>
+          <button
+            className="tx-btn"
+            onClick={() => {
+              import("./generateQuotePDF.js").then((mod) => {
+                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, shared);
+              });
+            }}
+            style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
+          >
+            Download Quote (PDF)
+          </button>
+        </div>
+      )}
+
       {/* ---- Cohort cards ---- */}
       <div style={{ marginBottom: "16px" }}>
         <div style={{ ...sectionLabelStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>

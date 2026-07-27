@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useRef } from "react";
 import MultiCohortView from "./MultiCohortView.jsx";
+import { generateHcvQuotePDF, generateGitQuotePDF, generateMultiCohortQuotePDF } from "./generateQuotePDF.js";
 
 // ---------------------------------------------------------------------------
 // Deterministic scoring engine — JS port of telematix_scoring.py.
@@ -1376,6 +1377,15 @@ function HcvRatingView({ sharedFleetInfo }) {
               <li><strong>Total SA market loading: {(result.total_sa_market_loading * 100).toFixed(0)}%</strong></li>
             </ul>
           </div>
+          <div style={{ marginTop: "16px", textAlign: "right" }}>
+            <button
+              className="tx-btn"
+              onClick={() => generateHcvQuotePDF(form, result)}
+              style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
+            >
+              Download Quote (PDF)
+            </button>
+          </div>
         </div>
       )}
       {result && result.error && (
@@ -1423,6 +1433,11 @@ function makeFleetInfoDefaults() {
 function FleetInformationView({ sharedFleetInfo, onSave }) {
   const [form, setForm] = useState(sharedFleetInfo || makeFleetInfoDefaults());
   const [saved, setSaved] = useState(false);
+  const [extractStatus, setExtractStatus] = useState("idle"); // idle | reading | extracting | done | error
+  const [extractError, setExtractError] = useState(null);
+  const [extractNotes, setExtractNotes] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef(null);
 
   const updateField = (key, value) => {
     setSaved(false);
@@ -1447,6 +1462,133 @@ function FleetInformationView({ sharedFleetInfo, onSave }) {
     setSaved(true);
   };
 
+  // --- Document extraction ---
+  const FLEET_INFO_EXTRACTION_PROMPT = `You are a data extraction tool for a South African HCV/GIT fleet insurance underwriter. You will be shown a PDF document — it could be a policy schedule, a fleet listing, a quote document, a broker submission, a needs analysis form, or any document containing fleet and cargo details.
+
+Extract ONLY what is explicitly stated in the document. Do not infer or estimate values. If a field is not mentioned or not clearly readable, set it to null.
+
+Map the extracted values to the closest matching option from the allowed values listed below. If no option matches, use the closest reasonable match and note it in extraction_notes.
+
+Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
+{
+  "fleet_name": string or null,
+  "vehicle_count": number or null,
+  "asset_class": one of ["hcv_general_freight","fuel_hazmat_tanker","minerals_bulk_long_haul","fmcg_distribution","bulk_liquids_non_hazmat","yellow_metal_plant","agricultural_equipment","refrigerated_cold_chain","abnormal_loads_oversized","drone_commercial"] or null,
+  "avg_sum_insured_per_vehicle": number or null,
+  "manufacturer": one of ["daf","faw","freightliner","hino","isuzu","man","mercedes_benz","other","scania","ud_trucks","volvo","western_star"] or null,
+  "year_model": number (4-digit year) or null,
+  "avg_km_per_vehicle_month": number or null,
+  "cargo_type": one of ["agricultural_produce","chemicals_hazmat_adr","chemicals_non_hazmat","electronics_high_value","fmcg_food_bev","fuel_petroleum","general_merchandise","livestock","minerals_mining","refrigerated","retail_clothing","steel_metals"] or null,
+  "operating_corridor": one of ["cross_border_sadc","kwazulu_natal_regional","mixed_sa_national","n1_cape_johannesburg","n1_north_limpopo_zimbabwe_border","n12_east_rand_port_elizabeth","n14_n4_botswana_border","n3_johannesburg_durban","northern_cape_manganese_routes","western_cape_regional"] or null,
+  "night_ops_pct": number (0-100) or null,
+  "anti_theft_devices": one of ["none","tracking_only","tracking_immobiliser"] or null,
+  "load_limit_per_vehicle": number or null,
+  "commodity_type": one of ["agricultural_grain","alcohol_beverages","ammunition_explosives_fireworks","antiques_artworks","automotive_parts","bloodstock_game","building_materials","bullion_cash_treasury_notes","cameras_cellphones_accessories","coal_mining_bulk","cobalt","computers_memory_systems","copper_any_form","documents_specie_stamps_tickets","electronics_tech","fmcg_branded_high_risk","fmcg_retail_general","fuel_petroleum","general_cargo","gold_silver_jewellery_watches_furs","machinery_equipment","metals_steel_chrome","non_ferrous_metals","pharmaceuticals","prepaid_phone_cards","refrigerated_goods","timber_paper","tobacco_cigars_cigarettes"] or null,
+  "geographic_zone": one of ["western_cape","medium_risk","gauteng_high_risk"] or null,
+  "claims_history": one of ["clean","one_claim"] or null,
+  "loss_ratio_pct": number or null,
+  "cover_type": one of ["all_risks","fire_collision_overturning_theft_hijack","fire_collision_overturning_only"] or null,
+  "iot_devices": [string] or null,
+  "is_high_value_cargo": boolean or null,
+  "is_rmp1_scoped": boolean or null,
+  "cargosnap_fitted": boolean or null,
+  "security_device": one of ["none","rmp1_top_lock","rmp2_cable_lock","rmp3_tracktag"] or null,
+  "extraction_notes": string
+}`;
+
+  const processDocument = useCallback(async (file) => {
+    if (!file || !(file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
+      setExtractStatus("error");
+      setExtractError("Please provide a PDF file.");
+      return;
+    }
+    setExtractStatus("reading");
+    setExtractError(null);
+    setExtractNotes(null);
+
+    try {
+      const b64 = await fileToBase64(file);
+      setExtractStatus("extracting");
+
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4000,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+                { type: "text", text: FLEET_INFO_EXTRACTION_PROMPT },
+              ],
+            },
+          ],
+        }),
+      });
+
+      const data = await response.json();
+      let rawText = (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("");
+      rawText = rawText.trim();
+      if (rawText.startsWith("```")) {
+        rawText = rawText.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+      }
+
+      const extracted = JSON.parse(rawText);
+
+      // Map extracted values into form fields (only overwrite non-null extractions)
+      setForm((prev) => {
+        const updated = { ...prev };
+        if (extracted.fleet_name) updated.fleet_name = extracted.fleet_name;
+        if (extracted.vehicle_count != null) updated.vehicle_count = extracted.vehicle_count;
+        if (extracted.asset_class) updated.asset_class = extracted.asset_class;
+        if (extracted.avg_sum_insured_per_vehicle != null) updated.avg_sum_insured_per_vehicle = extracted.avg_sum_insured_per_vehicle;
+        if (extracted.manufacturer) updated.manufacturer = extracted.manufacturer;
+        if (extracted.year_model != null) updated.year_model = extracted.year_model;
+        if (extracted.avg_km_per_vehicle_month != null) updated.avg_km_per_vehicle_month = extracted.avg_km_per_vehicle_month;
+        if (extracted.cargo_type) updated.cargo_type = extracted.cargo_type;
+        if (extracted.operating_corridor) updated.operating_corridor = extracted.operating_corridor;
+        if (extracted.night_ops_pct != null) updated.night_ops_pct = extracted.night_ops_pct;
+        if (extracted.anti_theft_devices) updated.anti_theft_devices = extracted.anti_theft_devices;
+        if (extracted.load_limit_per_vehicle != null) updated.load_limit_per_vehicle = extracted.load_limit_per_vehicle;
+        if (extracted.commodity_type) updated.commodity_type = extracted.commodity_type;
+        if (extracted.geographic_zone) updated.geographic_zone = extracted.geographic_zone;
+        if (extracted.claims_history) updated.claims_history = extracted.claims_history;
+        if (extracted.loss_ratio_pct != null) updated.loss_ratio_pct = extracted.loss_ratio_pct;
+        if (extracted.cover_type) updated.cover_type = extracted.cover_type;
+        if (Array.isArray(extracted.iot_devices) && extracted.iot_devices.length > 0) updated.iot_devices_fitted = extracted.iot_devices;
+        if (extracted.is_high_value_cargo != null) updated.is_high_value_cargo = extracted.is_high_value_cargo;
+        if (extracted.is_rmp1_scoped != null) updated.is_rmp1_scoped = extracted.is_rmp1_scoped;
+        if (extracted.cargosnap_fitted != null) updated.cargosnap_fitted = extracted.cargosnap_fitted;
+        if (extracted.security_device) updated.cvtscpi_rmp_tier = extracted.security_device;
+        return updated;
+      });
+
+      setExtractNotes(extracted.extraction_notes || null);
+      setExtractStatus("done");
+      setSaved(false);
+    } catch (err) {
+      setExtractStatus("error");
+      setExtractError("Extraction failed: " + (err.message || String(err)));
+    }
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) processDocument(file);
+  }, [processDocument]);
+
+  const handleFileSelect = useCallback((e) => {
+    const file = e.target.files[0];
+    if (file) processDocument(file);
+  }, [processDocument]);
+
   return (
     <div>
       <div
@@ -1464,6 +1606,51 @@ function FleetInformationView({ sharedFleetInfo, onSave }) {
       <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "20px", lineHeight: 1.5 }}>
         Capture fleet details here once, then open HCV Rating or GIT Quoting — each will start pre-filled
         from what you save below. Fields are still editable on each tab afterward.
+      </div>
+
+      {/* Document upload zone */}
+      <div style={{ marginBottom: "24px" }}>
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            border: `2px dashed ${dragOver ? "#B5762A" : "#CCC"}`,
+            borderRadius: "8px",
+            padding: "20px",
+            textAlign: "center",
+            cursor: "pointer",
+            background: dragOver ? "rgba(181,118,42,0.05)" : "transparent",
+            transition: "all 0.2s",
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf"
+            onChange={handleFileSelect}
+            style={{ display: "none" }}
+          />
+          <div style={{ fontSize: "0.88rem", color: "#14213D", fontWeight: 600 }}>
+            {extractStatus === "idle" && "Drop a PDF here or click to upload — policy schedule, fleet listing, quote, or broker submission"}
+            {extractStatus === "reading" && "Reading document..."}
+            {extractStatus === "extracting" && "Extracting fleet details — this takes a few seconds..."}
+            {extractStatus === "done" && "Extraction complete — fields populated below. Review and edit before saving."}
+            {extractStatus === "error" && "Extraction failed — fill in manually below."}
+          </div>
+          {extractStatus === "done" && (
+            <div style={{ fontSize: "0.78rem", color: "#3D6B4F", marginTop: "6px" }}>
+              Fields have been auto-filled from your document. Check each value below — the AI extracts, you confirm.
+            </div>
+          )}
+          {extractError && (
+            <div style={{ fontSize: "0.78rem", color: "#B23A2E", marginTop: "6px" }}>{extractError}</div>
+          )}
+          {extractNotes && (
+            <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "6px" }}>Notes: {extractNotes}</div>
+          )}
+        </div>
       </div>
 
       {/* Shared section */}
@@ -2584,6 +2771,15 @@ function GitQuotingView({ sharedFleetInfo }) {
           {typeof result.iot_credit.detail === "string" && (
             <div style={{ fontSize: "0.82rem", color: "#5C6570" }}>{result.iot_credit.detail}</div>
           )}
+          <div style={{ marginTop: "16px", textAlign: "right" }}>
+            <button
+              className="tx-btn"
+              onClick={() => generateGitQuotePDF(form, result)}
+              style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
+            >
+              Download Quote (PDF)
+            </button>
+          </div>
         </div>
       )}
       {result && result.error && (
