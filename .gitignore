@@ -1,3 +1,15 @@
 __pycache__/
 *.pyc
 .env
+# Local Netlify folder
+.netlify
+ 
+# Dev artifacts - patches, backups, dumps 
+*.cjs 
+*.bak 
+*_backup.py 
+*_dump*.txt 
+*_chunk*.txt 
+chunk*.txt 
+jsx_dump.txt 
+*.zip 

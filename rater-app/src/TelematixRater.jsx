@@ -455,53 +455,6 @@ function computeGitPvpm(f, override) {
   };
 }
 
-const GIT_BENCHMARK_SCENARIOS = [
-  {
-    label: "Motorworld — FMCG branded, no IoT",
-    input: makeGitFleetInput({
-      fleet_name: "Motorworld",
-      vehicle_count: 106,
-      load_limit_per_vehicle: 1500000,
-      commodity_type: "fmcg_branded_high_risk",
-    }),
-  },
-  {
-    label: "General cargo — GPS + geofencing, no RMP scope",
-    input: makeGitFleetInput({
-      fleet_name: "GeneralCargoCo",
-      vehicle_count: 50,
-      load_limit_per_vehicle: 500000,
-      commodity_type: "general_cargo",
-      iot_devices_fitted: ["gps_realtime_tracking", "geofencing_alerting"],
-    }),
-  },
-  {
-    label: "High-value cargo — RMP1-scoped, NO lock fitted",
-    input: makeGitFleetInput({
-      fleet_name: "HighValueNoLock",
-      vehicle_count: 20,
-      load_limit_per_vehicle: 800000,
-      commodity_type: "fmcg_branded_high_risk",
-      is_high_value_cargo: true,
-      is_rmp1_scoped: true,
-      cvtscpi_rmp_tier: "none",
-    }),
-  },
-  {
-    label: "High-value cargo — RMP1 fitted + Cargosnap",
-    input: makeGitFleetInput({
-      fleet_name: "HighValueCompliant",
-      vehicle_count: 20,
-      load_limit_per_vehicle: 800000,
-      commodity_type: "fmcg_branded_high_risk",
-      is_high_value_cargo: true,
-      is_rmp1_scoped: true,
-      cvtscpi_rmp_tier: "rmp1_top_lock",
-      cargosnap_fitted: true,
-    }),
-  },
-];
-
 // ---------------------------------------------------------------------------
 // HCV rating/premium engine — JS port of hcv_rating_engine.py, built from
 // TelematiX_SA_Rating_Engine_Frans_Prinsloo_3.xlsx (June 2026). Calibrated
@@ -670,11 +623,11 @@ function hcvClaimsExperienceLoading(lossRatioPct) {
 }
 
 // Static risk questionnaire (Lombard reference slide + Frans-confirmed
-// scope). 7 items, each 0-100, averaged into a 10% weighted factor
+// scope). 7 items, each 0/35/70/100, averaged into a 10% weighted factor
 // matching the pitch deck's 10-factor model. avg km/month, cargo type,
-// and Route Risk Level deliberately excluded -- already price elsewhere.
-// NO SCORING RUBRIC EXISTS YET for what makes each item score 20 vs 80 --
-// that's Frans's call, not invented here.
+// and Route Risk Level deliberately excluded -- already priced elsewhere.
+// 4-tier scoring rubric drafted 25 Jul 2026, provisionally approved by
+// Frans -- see HCV_STATIC_QUESTIONNAIRE_RUBRIC below.
 const HCV_STATIC_QUESTIONNAIRE_ITEMS = [
   "driving_hour_policy",
   "max_speed_policy",
@@ -690,6 +643,56 @@ function hcvComputeStaticRiskScore(f) {
   const sum = values.reduce((a, b) => a + b, 0);
   return hcvExcelRound(sum / HCV_STATIC_QUESTIONNAIRE_ITEMS.length, 1);
 }
+
+// 4-tier scoring rubric (0 / 35 / 70 / 100) per item -- drafted for Frans
+// 25 Jul 2026, provisionally approved ("looks right", detailed review to
+// follow). Replaces free-text 0-100 entry with a fixed rubric so different
+// brokers scoring the same fleet converge on the same number.
+const HCV_STATIC_QUESTIONNAIRE_RUBRIC = {
+  driving_hour_policy: {
+    0: "No written driving-hour policy exists. No maximum shift length defined.",
+    35: "Written policy exists but compliance tracked manually (paper logbooks), no regular audit.",
+    70: "Written policy with defined shift limits. Compliance monitored via electronic logbooks or telematics alerts.",
+    100: "Policy enforced via real-time telematics monitoring with automated fatigue/shift-limit alerts. Regular audits, documented disciplinary process.",
+  },
+  max_speed_policy: {
+    0: "No speed policy exists. No speed limiters or GPS-based speed monitoring.",
+    35: "Speed policy exists on paper. Factory speed limiters only, no active monitoring.",
+    70: "Written speed policy with defined limits. GPS/telematics monitoring with regular management review. Repeat offenders formally warned.",
+    100: "Speed policy enforced via real-time telematics alerts. Automated exception reports, escalation triggers, documented disciplinary outcomes.",
+  },
+  telematics_use_for_driver_management: {
+    0: "No telematics platform, or data not used for any management purpose.",
+    35: "Telematics installed and collected, but only reviewed reactively after incidents.",
+    70: "Telematics data reviewed regularly (weekly/monthly). Driver scorecards produced and shared with drivers.",
+    100: "Telematics is the backbone of driver management: real-time dashboards, automated scorecards, feeds training/bonus/disciplinary processes.",
+  },
+  route_distance: {
+    0: "No route planning or distance management. Drivers choose their own routes.",
+    35: "Basic route planning (preferred corridors communicated verbally). No electronic route compliance monitoring.",
+    70: "Routes planned and assigned electronically. GPS tracking confirms compliance with deviation alerts.",
+    100: "Dynamic route planning integrated with telematics. Real-time deviation alerts, geofenced rest stops, route efficiency analytics.",
+  },
+  driver_training_programme: {
+    0: "No formal training programme. Drivers hired on licence and experience only.",
+    35: "Basic induction on hire, no scheduled refresher training, no defensive driving.",
+    70: "Formal induction covering vehicle operation, cargo handling, safety. Annual refresher and defensive driving course completed.",
+    100: "Comprehensive induction + annual refreshers + advanced defensive driving certification + cargo-specific training, driven by telematics/incident data.",
+  },
+  driver_employment_process: {
+    0: "No structured hiring process. Licence check only.",
+    35: "Basic hiring: licence validity, one reference check. No criminal record check, no medical fitness assessment.",
+    70: "Structured process: licence verification, criminal record check, 2+ references, medical fitness assessment, defined probation period.",
+    100: "Comprehensive process: all of the above plus psychometric evaluation, telematics-based probation review, periodic re-screening.",
+  },
+  driver_remuneration: {
+    0: "Drivers paid purely per trip/km. No fixed component. Incentivises speed and distance over safety.",
+    35: "Fixed salary below market, supplemented by per-trip bonuses with no safety/compliance component.",
+    70: "Market-competitive fixed salary. Bonus includes a safety/compliance component.",
+    100: "Competitive fixed salary with bonus directly linked to telematics scorecard performance. Penalty mechanisms for repeat violations.",
+  },
+};
+const HCV_STATIC_QUESTIONNAIRE_TIER_LABELS = { 0: "0 — None", 35: "35 — Basic", 70: "70 — Good", 100: "100 — Best practice" };
 
 // Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology, Q1):
 // top of the Medium band (31-65), not the workbook's own mixed-band sample
@@ -1163,11 +1166,11 @@ function HcvRatingView({ sharedFleetInfo }) {
       </div>
 
       <div style={{ marginBottom: "20px" }}>
-        <SectionLabel>Static risk questionnaire (optional -- 7 items, 0-100 each)</SectionLabel>
+        <SectionLabel>Static risk questionnaire (optional -- 7 items, 4-tier rubric)</SectionLabel>
         <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "8px", marginBottom: "10px", lineHeight: 1.5 }}>
-          Leave blank to use the Yes/No completeness check above instead. Fill in all 7 to use the
-          richer 10%-weighted score (Frans-confirmed scope) -- no scoring rubric published yet, use
-          underwriting judgement.
+          Leave on "Not scored" to use the Yes/No completeness check above instead. Score all 7 to use the
+          richer 10%-weighted score. Rubric drafted for and provisionally approved by Frans (25 Jul 2026) --
+          each tier defined by a concrete, checkable criterion so different brokers converge on the same score.
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
           {[
@@ -1180,16 +1183,23 @@ function HcvRatingView({ sharedFleetInfo }) {
             ["driver_remuneration", "Driver remuneration"],
           ].map(([key, label]) => (
             <FormField key={key} label={label}>
-              <input
-                onFocus={(e) => setTimeout(() => e.target.select(), 0)}
-                type="number"
-                min="0"
-                max="100"
+              <select
                 value={form[key] ?? ""}
                 onChange={(e) => updateField(key, e.target.value === "" ? null : Number(e.target.value))}
-                onWheel={(e) => e.target.blur()}
                 style={formInputStyle}
-              />
+              >
+                <option value="">Not scored</option>
+                {[0, 35, 70, 100].map((tier) => (
+                  <option key={tier} value={tier}>
+                    {HCV_STATIC_QUESTIONNAIRE_TIER_LABELS[tier]}
+                  </option>
+                ))}
+              </select>
+              {form[key] != null && (
+                <div style={{ fontSize: "0.74rem", color: "#5C6570", marginTop: "6px", lineHeight: 1.4 }}>
+                  {HCV_STATIC_QUESTIONNAIRE_RUBRIC[key][form[key]]}
+                </div>
+              )}
             </FormField>
           ))}
         </div>
@@ -1923,11 +1933,11 @@ export default function TelematixRater() {
               lineHeight: 1.15,
             }}
           >
-            HCV / GIT Fleet Risk Rater
+            HCV / GIT Fleet Risk & Multi-Cohort Rater
           </h1>
           <p style={{ color: "#5C6570", fontSize: "0.95rem", marginTop: "8px", marginBottom: 0 }}>
-            Upload a document or enter fleet details manually across HCV risk scoring, HCV rating, and GIT quoting —
-            extraction and scoring always run separately, the rating is never guessed by the model.
+            Capture fleet details once in Fleet Information to pre-fill HCV Rating, GIT Quoting, and Multi-Cohort —
+            or upload a document for automated risk scoring. Extraction and scoring always run separately, the rating is never guessed by the model.
           </p>
         </div>
 
@@ -2167,15 +2177,6 @@ function GitQuotingView({ sharedFleetInfo }) {
   const [overrideReasonText, setOverrideReasonText] = useState("");
   const [manualFactorInput, setManualFactorInput] = useState("");
 
-  const loadPreset = (scenario) => {
-    setSelected(scenario.label);
-    setForm(scenario.input);
-    setResult(null);
-    setOverrideApproverName("");
-    setOverrideReasonText("");
-    setManualFactorInput("");
-  };
-
   const updateField = (key, value) => {
     setSelected(null);
     setForm((f) => ({ ...f, [key]: value }));
@@ -2226,27 +2227,6 @@ function GitQuotingView({ sharedFleetInfo }) {
         }}
       >
         GIT Quoting
-      </div>
-
-      <div style={{ marginBottom: "18px" }}>
-        <SectionLabel>Quick-fill benchmark scenarios</SectionLabel>
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
-          {GIT_BENCHMARK_SCENARIOS.map((scenario) => (
-            <button
-              key={scenario.label}
-              className="tx-btn"
-              onClick={() => loadPreset(scenario)}
-              style={{
-                ...tabBtnStyle,
-                textAlign: "left",
-                background: selected === scenario.label ? "rgba(181,118,42,0.1)" : "transparent",
-                borderColor: selected === scenario.label ? "#B5762A" : "#14213D",
-              }}
-            >
-              {scenario.label}
-            </button>
-          ))}
-        </div>
       </div>
 
       <div style={{ marginBottom: "20px" }}>
