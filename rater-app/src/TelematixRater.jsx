@@ -1465,7 +1465,11 @@ function FleetInformationView({ sharedFleetInfo, onSave }) {
   // --- Document extraction ---
   const FLEET_INFO_EXTRACTION_PROMPT = `You are a data extraction tool for a South African HCV/GIT fleet insurance underwriter. You will be shown a PDF document — it could be a policy schedule, a fleet listing, a quote document, a broker submission, a needs analysis form, or any document containing fleet and cargo details.
 
-Extract ONLY what is explicitly stated in the document. Do not infer or estimate values. If a field is not mentioned or not clearly readable, set it to null.
+CRITICAL PRIVACY RULE: Never extract, repeat, or reference any personal identifying information — this includes ID numbers, passport numbers, dates of birth, banking details, or any government-issued identifier, even if visible in the document. If the insured's name is needed for context, use it, but never include ID/identity numbers anywhere in your output, including extraction_notes. This applies regardless of how clearly the document displays such numbers.
+
+Extract ONLY what is explicitly stated in the document. Do not guess or invent values that aren't grounded in the document.
+
+IMPORTANT DISTINCTION for vehicle_count and avg_sum_insured_per_vehicle specifically: if the document lists individual vehicles/assets in a table or schedule (even across multiple categories like trucks, trailers, other), COUNT the listed line items and SUM their individual values yourself — this is arithmetic on visible data, not a guess, and you should always do it rather than leaving these two fields null. Only leave vehicle_count or avg_sum_insured_per_vehicle null if the document truly contains no vehicle listing or values at all. Briefly note your counting/summing method in extraction_notes so it can be checked. For every OTHER field (asset_class, cargo_type, manufacturer, corridor, etc.), remain conservative: only fill from what's explicitly stated or a clear closest-match, and set to null if genuinely unclear.
 
 Map the extracted values to the closest matching option from the allowed values listed below. If no option matches, use the closest reasonable match and note it in extraction_notes.
 
@@ -1894,6 +1898,8 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
 // ---------------------------------------------------------------------------
 
 const EXTRACTION_PROMPT = `You are a data extraction tool. You will be shown a PDF that is one of two document types used by a South African HCV/GIT insurance underwriter:
+
+CRITICAL PRIVACY RULE: Never extract, repeat, or reference any personal identifying information — this includes ID numbers, passport numbers, dates of birth, banking details, or any government-issued identifier, even if visible in the document. This applies regardless of how clearly the document displays such numbers.
 
 TYPE A: An RMS/LibroAssist "Transporter Risk Report" — a telematics/i-Cab risk report with monthly graphs and tables of driver behaviour scores.
 TYPE B: An insurer policy schedule with GIT cover limits, premiums, and vehicle lists.
