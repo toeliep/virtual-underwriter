@@ -715,10 +715,9 @@ function makeHcvFleetInput(overrides) {
     manufacturer: "mercedes_benz",
     year_model: new Date().getFullYear(),
     avg_km_per_vehicle_month: 0,
-    // Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology).
-    // Defaults to true so existing behaviour is unchanged unless explicitly
-    // toggled off in the HCV Rating tab.
-    telemetry_available: true,
+    // Frans-confirmed (Decision Memo: HCV Data-Source Qualifier, Aug 2026).
+    // Three-option selector replaces the old binary telemetry_available toggle.
+    hcv_data_source: "none",
     fatigue_hos: 0,
     speeding: 0,
     cellphone_usage: 0,
@@ -878,12 +877,16 @@ function computeHcvPremium(f) {
     profile = "C";
   }
 
-  // Frans-confirmed (Decision Memo: No-Telemetry Fallback Methodology, Q2):
-  // a fleet without real telemetry can never reach Profile A auto-accept,
-  // regardless of computed score -- downgrade to Profile B here.
-  if (profile === "A" && !f.telemetry_available) {
+  // Frans-confirmed (Decision Memo: HCV Data-Source Qualifier, Aug 2026):
+  // Only Fleetboard + video reaches full 96.2% coverage → Profile A eligible.
+  // OEM-only (61.2% — cellphone + belt are blind spots) and no-telematics both
+  // cap at Profile B regardless of computed score.
+  if (profile === "A" && f.hcv_data_source !== "oem_video") {
     profile = "B";
-    verdict = `CONDITIONAL ACCEPT - Profile B (capped from Profile A: no real telemetry data -- estimated scores only, per underwriting policy). Score: ${combinedScore.toFixed(0)} | Factor: ${combinedRatingFactor.toFixed(2)}x | Premium: R${riskAdjustedPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Mandatory: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right.`;
+    const capReason = f.hcv_data_source === "oem_only"
+      ? "OEM telematics only (61.2% coverage — cellphone & belt data unavailable without driver-facing camera)"
+      : "no real telematics data — estimated scores only";
+    verdict = `CONDITIONAL ACCEPT - Profile B (capped from Profile A: ${capReason}, per underwriting policy). Score: ${combinedScore.toFixed(0)} | Factor: ${combinedRatingFactor.toFixed(2)}x | Premium: R${riskAdjustedPremium.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}. Mandatory: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right.`;
   }
 
   return {
@@ -1052,38 +1055,55 @@ function HcvRatingView({ sharedFleetInfo }) {
       <div style={{ marginBottom: "20px" }}>
         <SectionLabel>Telematics behavioural scores (0–100, approved platform)</SectionLabel>
 
-        <label style={{ ...checkboxLabelStyle, marginTop: "10px", marginBottom: "10px", display: "flex" }}>
-          <input
-            type="checkbox"
-            checked={form.telemetry_available}
-            onChange={(e) => {
-              const available = e.target.checked;
-              setForm((f) => {
-                if (available) return { ...f, telemetry_available: true };
-                // Frans-confirmed Q1: default every score to top-of-Medium (65)
-                // when real telemetry isn't available.
-                return {
-                  ...f,
-                  telemetry_available: false,
-                  fatigue_hos: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  speeding: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  cellphone_usage: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  safety_belt_compliance: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  driver_behaviour_composite: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  distance_index: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  device_integrity: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  time_on_road: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                  night_driving_ratio: HCV_NO_TELEMETRY_DEFAULT_SCORE,
-                };
-              });
-            }}
-          />
-          Real telemetry data available for this fleet
-        </label>
-        {!form.telemetry_available && (
+        {/* HCV data-source qualifier — Frans-confirmed Aug 2026; replaces binary telemetry_available */}
+        <div style={{ marginTop: "10px", marginBottom: "6px", fontSize: "0.78rem", color: "#5C6570" }}>
+          HCV telematics data source
+        </div>
+        <select
+          value={form.hcv_data_source || "none"}
+          style={{ ...formInputStyle, marginBottom: "8px" }}
+          onChange={(e) => {
+            const ds = e.target.value;
+            setForm((f) => {
+              if (ds === "oem_video") return { ...f, hcv_data_source: ds };
+              if (ds === "oem_only") {
+                // Cellphone (15%) and belt (10%) are blind without camera — default those.
+                return { ...f, hcv_data_source: ds, cellphone_usage: HCV_NO_TELEMETRY_DEFAULT_SCORE, safety_belt_compliance: HCV_NO_TELEMETRY_DEFAULT_SCORE };
+              }
+              // No telematics — default all scored fields to top-of-Medium.
+              return {
+                ...f,
+                hcv_data_source: ds,
+                fatigue_hos: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                speeding: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                cellphone_usage: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                safety_belt_compliance: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                driver_behaviour_composite: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                distance_index: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                device_integrity: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                time_on_road: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+                night_driving_ratio: HCV_NO_TELEMETRY_DEFAULT_SCORE,
+              };
+            });
+          }}
+        >
+          <option value="none">No telematics — Profile B cap, mandatory conditions (1.40×)</option>
+          <option value="oem_only">Fleetboard / OEM only — 61.2% coverage, Profile B cap (1.40×)</option>
+          <option value="oem_video">Fleetboard + driver-facing video — 96.2% coverage, Profile A eligible (0.70×)</option>
+        </select>
+        {(form.hcv_data_source === "none" || !form.hcv_data_source) && (
           <div style={{ fontSize: "0.78rem", color: "#B5762A", marginBottom: "10px", lineHeight: 1.5 }}>
-            No real telemetry — scores defaulted to {HCV_NO_TELEMETRY_DEFAULT_SCORE} (top of Medium band).
-            This fleet is capped at Profile B (Conditional Accept) regardless of computed score.
+            No telematics — all scores defaulted to {HCV_NO_TELEMETRY_DEFAULT_SCORE} (top of Medium band). Fleet capped at Profile B regardless of computed score.
+          </div>
+        )}
+        {form.hcv_data_source === "oem_only" && (
+          <div style={{ fontSize: "0.78rem", color: "#B5762A", marginBottom: "10px", lineHeight: 1.5 }}>
+            OEM only — cellphone usage and safety-belt compliance defaulted to {HCV_NO_TELEMETRY_DEFAULT_SCORE} (data gap: no camera). Fleet capped at Profile B.
+          </div>
+        )}
+        {form.hcv_data_source === "oem_video" && (
+          <div style={{ fontSize: "0.78rem", color: "#2E6B3E", marginBottom: "10px", lineHeight: 1.5 }}>
+            Full coverage — 96.2% visibility. Profile A eligible. All 10 metrics can be entered.
           </div>
         )}
 
@@ -1106,10 +1126,16 @@ function HcvRatingView({ sharedFleetInfo }) {
                 min="0"
                 max="100"
                 value={form[key]}
-                disabled={!form.telemetry_available}
+                disabled={
+                  form.hcv_data_source === "none" ||
+                  (form.hcv_data_source === "oem_only" && (key === "cellphone_usage" || key === "safety_belt_compliance"))
+                }
                 onChange={(e) => updateField(key, Number(e.target.value))}
                 onWheel={(e) => e.target.blur()}
-                style={{ ...formInputStyle, opacity: form.telemetry_available ? 1 : 0.6 }}
+                style={{
+                  ...formInputStyle,
+                  opacity: (form.hcv_data_source === "none" || (form.hcv_data_source === "oem_only" && (key === "cellphone_usage" || key === "safety_belt_compliance"))) ? 0.5 : 1,
+                }}
               />
             </FormField>
           ))}
@@ -1415,6 +1441,16 @@ function makeFleetInfoDefaults() {
     trend_direction: "stable",
     device_concealment_events_per_month: 0,
     static_questionnaire_complete: true,
+    // HCV data-source qualifier (Frans-confirmed Aug 2026 — replaces binary telemetry_available)
+    hcv_data_source: "none",
+    // Static questionnaire (7 items, 4-tier rubric)
+    sq_driving_hour_policy: null,
+    sq_max_speed_policy: null,
+    sq_telematics_driver_mgmt: null,
+    sq_route_distance_mgmt: null,
+    sq_driver_training: null,
+    sq_driver_employment: null,
+    sq_driver_remuneration: null,
     // GIT block
     load_limit_per_vehicle: 0,
     commodity_type: "general_cargo",
@@ -1608,8 +1644,7 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
         Fleet Information
       </div>
       <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "20px", lineHeight: 1.5 }}>
-        Capture fleet details here once, then open HCV Rating or GIT Quoting — each will start pre-filled
-        from what you save below. Fields are still editable on each tab afterward.
+        Capture fleet details here once — they carry through to Risk Scoring and Multi-Cohort automatically. Fill in as much as you have; fields can be adjusted at each step.
       </div>
 
       {/* Document upload zone */}
@@ -1673,8 +1708,12 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
             <input
               onFocus={(e) => setTimeout(() => e.target.select(), 0)}
               type="number"
-              value={form.vehicle_count}
-              onChange={(e) => updateField("vehicle_count", Number(e.target.value))}
+              min="0"
+              // Bug fix #5: show blank when 0 so first keystroke doesn't
+              // produce a leading zero (e.g. "07").
+              value={form.vehicle_count === 0 ? "" : form.vehicle_count}
+              placeholder="0"
+              onChange={(e) => updateField("vehicle_count", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
               onWheel={(e) => e.target.blur()}
               style={formInputStyle}
             />
@@ -1697,7 +1736,26 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           </FormField>
           <FormField label="Avg sum insured per vehicle (R)">
             <input
-              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.avg_sum_insured_per_vehicle} onChange={(e) => updateField("avg_sum_insured_per_vehicle", Number(e.target.value))} onWheel={(e) => e.target.blur()} step="50000" style={formInputStyle} />
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              min="0"
+              step="50000"
+              // Bug fix #5: show blank when 0 to avoid leading zero on first keystroke
+              value={form.avg_sum_insured_per_vehicle === 0 ? "" : form.avg_sum_insured_per_vehicle}
+              placeholder="0"
+              onChange={(e) => updateField("avg_sum_insured_per_vehicle", e.target.value === "" ? 0 : Math.max(0, Number(e.target.value)) || 0)}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
+            {/* Bug fix #7: soft warning for implausibly large sum-insured.
+                R15m threshold catches the R179m-instead-of-R1.79m class of
+                typo without false-positive-ing on legitimate high-value HCV
+                (armoured trucks, crane trucks, etc. rarely exceed R10m). */}
+            {form.avg_sum_insured_per_vehicle > 15000000 && (
+              <div style={{ marginTop: "4px", fontSize: "0.75rem", color: "#B23A2E" }}>
+                ⚠ R{(form.avg_sum_insured_per_vehicle / 1000000).toFixed(2)}m per vehicle looks high — did you mean R{(form.avg_sum_insured_per_vehicle / 100).toLocaleString()}?
+              </div>
+            )}
           </FormField>
           <FormField label="Manufacturer">
             <select value={form.manufacturer} onChange={(e) => updateField("manufacturer", e.target.value)} style={formInputStyle}>
@@ -1712,7 +1770,15 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           </FormField>
           <FormField label="Avg km / vehicle / month">
             <input
-              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.avg_km_per_vehicle_month} onChange={(e) => updateField("avg_km_per_vehicle_month", Number(e.target.value))} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              type="number"
+              min="0"
+              value={form.avg_km_per_vehicle_month === 0 ? "" : form.avg_km_per_vehicle_month}
+              placeholder="0"
+              onChange={(e) => updateField("avg_km_per_vehicle_month", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle}
+            />
           </FormField>
           <FormField label="Primary cargo type (HCV)">
             <select value={form.cargo_type} onChange={(e) => updateField("cargo_type", e.target.value)} style={formInputStyle}>
@@ -1758,6 +1824,30 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
               <option value="no">No</option>
             </select>
           </FormField>
+          <div style={{ gridColumn: "1 / -1" }}>
+            <FormField label="HCV telematics data source">
+              <select value={form.hcv_data_source || "none"} onChange={(e) => updateField("hcv_data_source", e.target.value)} style={formInputStyle}>
+                <option value="none">No telematics — Profile B cap, mandatory conditions (1.40×)</option>
+                <option value="oem_only">Fleetboard / OEM only — 61.2% coverage, Profile B cap (1.40×)</option>
+                <option value="oem_video">Fleetboard + driver-facing video — 96.2% coverage, Profile A eligible (0.70×)</option>
+              </select>
+            </FormField>
+            {form.hcv_data_source === "none" && (
+              <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "4px", lineHeight: 1.5 }}>
+                No telematics — fleet capped at Profile B. Mandatory conditions: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right. Factor: 1.40× applied in Multi-Cohort pricing.
+              </div>
+            )}
+            {form.hcv_data_source === "oem_only" && (
+              <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "4px", lineHeight: 1.5 }}>
+                OEM telematics — cellphone usage (15% weight) and safety-belt compliance (10% weight) are data gaps; no camera to see them. Fleet capped at Profile B. Add a driver-facing camera to reach Profile A. Factor: 1.40× applied in Multi-Cohort pricing.
+              </div>
+            )}
+            {form.hcv_data_source === "oem_video" && (
+              <div style={{ fontSize: "0.78rem", color: "#2E6B3E", marginTop: "4px", lineHeight: 1.5 }}>
+                Full coverage — 96.2% data visibility across all 10 telematics metrics. Profile A eligible. Factor: 0.70× applied in Multi-Cohort pricing.
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1771,9 +1861,12 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
             <input
               onFocus={(e) => setTimeout(() => e.target.select(), 0)}
               type="number"
-              value={form.load_limit_per_vehicle}
+              min="0"
+              step="50000"
+              value={form.load_limit_per_vehicle === 0 ? "" : form.load_limit_per_vehicle}
+              placeholder="0"
               onChange={(e) => {
-                const value = Number(e.target.value);
+                const value = e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0;
                 setSaved(false);
                 setForm((f) => ({
                   ...f,
@@ -1785,7 +1878,6 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
                 }));
               }}
               onWheel={(e) => e.target.blur()}
-              step="50000"
               style={formInputStyle}
             />
           </FormField>
@@ -1869,6 +1961,81 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
         </div>
       </div>
 
+      {/* Static risk questionnaire */}
+      <div style={{ border: "1.5px solid #14213D", borderRadius: "8px", padding: "18px", marginBottom: "24px" }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.72rem", color: "#14213D", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "6px" }}>
+          Static Risk Questionnaire (optional — 7 items)
+        </div>
+        <div style={{ fontSize: "0.78rem", color: "#5C6570", marginBottom: "14px" }}>
+          Each item scores 0 / 35 / 70 / 100. Leave "Not scored" to skip — skipped items are excluded from the composite. Scores feed Risk Scoring automatically when you save.
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px" }}>
+          <FormField label="Driving hour policy">
+            <select value={form.sq_driving_hour_policy ?? ""} onChange={(e) => updateField("sq_driving_hour_policy", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Max speed policy">
+            <select value={form.sq_max_speed_policy ?? ""} onChange={(e) => updateField("sq_max_speed_policy", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Telematics used for driver management">
+            <select value={form.sq_telematics_driver_mgmt ?? ""} onChange={(e) => updateField("sq_telematics_driver_mgmt", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Route & distance management">
+            <select value={form.sq_route_distance_mgmt ?? ""} onChange={(e) => updateField("sq_route_distance_mgmt", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Driver training programme">
+            <select value={form.sq_driver_training ?? ""} onChange={(e) => updateField("sq_driver_training", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Driver employment process">
+            <select value={form.sq_driver_employment ?? ""} onChange={(e) => updateField("sq_driver_employment", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+          <FormField label="Driver remuneration structure">
+            <select value={form.sq_driver_remuneration ?? ""} onChange={(e) => updateField("sq_driver_remuneration", e.target.value === "" ? null : Number(e.target.value))} style={formInputStyle}>
+                <option value="">Not scored</option>
+                <option value="0">Not in place</option>
+                <option value="35">Informal / ad hoc</option>
+                <option value="70">Documented policy, some monitoring</option>
+                <option value="100">Full policy, enforced & reviewed</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
       <button
         className="tx-btn"
         onClick={handleSave}
@@ -1888,7 +2055,7 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
       </button>
       {saved && (
         <div style={{ marginTop: "12px", fontSize: "0.82rem", color: "#3D6B4F" }}>
-          Saved. Open HCV Rating or GIT Quoting — both will start pre-filled from this.
+          Saved — fleet details and questionnaire scores carried through to Risk Scoring and Multi-Cohort.
         </div>
       )}
     </div>
@@ -1992,9 +2159,243 @@ function fileToBase64(file) {
   });
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RiskScoringView — Stage 2: standalone score view (no premium shown here)
+// ─────────────────────────────────────────────────────────────────────────────
+function RiskScoringView({ sharedFleetInfo, onProceedToPricing }) {
+  const defaults = {
+    fatigue_hos: 0, speeding: 0, cellphone_usage: 0,
+    safety_belt_compliance: 0, driver_behaviour_composite: 0,
+    distance_index: 0, device_integrity: 0,
+    time_on_road: 0, night_driving_ratio: 0,
+    device_concealment_events_per_month: 0,
+    avg_km_per_vehicle_month: 0,
+    trend: "stable",
+    static_q1: "", static_q2: "", static_q3: "",
+    static_q4: "", static_q5: "", static_q6: "", static_q7: "",
+    data_source: "oem_only",
+  };
+
+  const [f, setF] = React.useState(() => {
+    if (!sharedFleetInfo) return defaults;
+    return { ...defaults, ...sharedFleetInfo };
+  });
+  const [scored, setScored] = React.useState(null);
+
+  const update = (k, v) => setF(prev => ({ ...prev, [k]: v }));
+
+  const numInput = (label, key, max = 100) => (
+    <div style={{ marginBottom: "10px" }}>
+      <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 600, color: "#14213D", marginBottom: "3px" }}>{label}</label>
+      <input type="number" min={0} max={max} value={f[key]}
+        onFocus={e => setTimeout(() => e.target.select(), 0)}
+        onChange={e => update(key, Math.min(max, Math.max(0, Number(e.target.value))))}
+        style={{ width: "100%", padding: "7px 10px", border: "1px solid #C8D0DC", borderRadius: "5px", fontSize: "0.9rem", boxSizing: "border-box" }} />
+    </div>
+  );
+
+  const STATIC_LABELS = [
+    "1. Driving Hour Policy (formalised, enforced)",
+    "2. Maximum Speed Policy (written, monitored)",
+    "3. Telematics Used for Driver Management",
+    "4. Route / Distance Management",
+    "5. Driver Training Programme",
+    "6. Driver Employment Process (screening)",
+    "7. Driver Remuneration (incentive-aligned)",
+  ];
+  const STATIC_OPTS = [
+    { value: "", label: "Not scored" },
+    { value: "0",  label: "0 — Not in place" },
+    { value: "35", label: "35 — Informal / partial" },
+    { value: "70", label: "70 — Documented, inconsistently applied" },
+    { value: "100", label: "100 — Fully implemented, actively monitored" },
+  ];
+
+  function computeScore() {
+    const w = {
+      fatigue_hos: 0.20, speeding: 0.15, cellphone_usage: 0.15,
+      safety_belt_compliance: 0.10, driver_behaviour_composite: 0.10,
+      distance_index: 0.08, device_integrity: 0.07,
+      time_on_road: 0.03, night_driving_ratio: 0.02,
+    };
+    let weighted = 0;
+    Object.entries(w).forEach(([k, wt]) => { weighted += (f[k] || 0) * wt; });
+
+    // Concealment addition
+    const conc = f.device_concealment_events_per_month || 0;
+    const concAdd = conc > 200 ? 30 : conc > 100 ? 15 : 0;
+
+    // Trend
+    const trendMap = { improving_strongly: -0.15, improving_slightly: -0.05, stable: 0, deteriorating_slightly: 0.10, deteriorating_3plus_months: 0.20 };
+    const trendAdd = weighted * (trendMap[f.trend] || 0);
+
+    // Static questionnaire
+    const staticVals = [f.static_q1,f.static_q2,f.static_q3,f.static_q4,f.static_q5,f.static_q6,f.static_q7]
+      .filter(v => v !== "" && v != null).map(Number);
+    const staticScore = staticVals.length > 0 ? staticVals.reduce((a,b) => a+b, 0) / staticVals.length : null;
+    const questPenalty = staticScore != null ? 0 : 0; // blended below
+
+    let combined;
+    if (staticScore != null) {
+      combined = (weighted * 0.90) + (staticScore * 0.10) + concAdd + trendAdd;
+    } else {
+      combined = weighted + concAdd + trendAdd;
+    }
+
+    // Auto-decline checks
+    const declines = [];
+    if (combined > 100) declines.push("Combined score > 100");
+    if ((f.avg_km_per_vehicle_month || 0) > 16000) declines.push("Avg km/vehicle/month > 16,000 (illegal HoS)");
+    if (conc > 200) declines.push("Device concealment > 200 events/month");
+    if ((f.speeding || 0) > 60 && (f.fatigue_hos || 0) > 80) declines.push("Speeding > 60 AND Fatigue > 80 simultaneously");
+
+    // Profile
+    let profile, factor;
+    if (declines.length > 0) {
+      profile = "DECLINE"; factor = null;
+    } else if (combined <= 25) {
+      profile = "Profile A"; factor = 0.70;
+    } else if (combined <= 45) {
+      profile = "Profile A"; factor = 0.95;
+    } else if (combined <= 65) {
+      profile = "Profile B — Conditional Accept"; factor = 1.40;
+    } else if (combined <= 85) {
+      profile = "Profile C — Decline"; factor = 1.90;
+    } else {
+      profile = "Profile C — Decline"; factor = 2.50;
+    }
+
+    // Data-source cap
+    let capNote = null;
+    if (profile === "Profile A" && f.data_source !== "oem_video") {
+      capNote = `Profile A capped to Profile B — data source "${f.data_source}" does not provide 96.2% behavioural coverage. Fleetboard + driver-facing video required for Profile A.`;
+      profile = "Profile B — Conditional Accept (capped)"; factor = 1.40;
+    }
+
+    return { combined: combined.toFixed(1), weighted: weighted.toFixed(1), staticScore: staticScore != null ? staticScore.toFixed(1) : "Not scored", concAdd, trendAdd: trendAdd.toFixed(1), profile, factor, declines, capNote };
+  }
+
+  const cardStyle = { background: "#fff", border: "1px solid #E0E6EE", borderRadius: "8px", padding: "20px", marginBottom: "16px" };
+  const sectionLabel = { fontSize: "0.78rem", fontWeight: 700, color: "#B5762A", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "12px" };
+
+  return (
+    <div style={{ maxWidth: "860px", margin: "0 auto" }}>
+      <div style={{ background: "#E8EDF5", borderRadius: "8px", padding: "14px 18px", marginBottom: "20px", fontSize: "0.88rem", color: "#14213D" }}>
+        <strong>Stage 2 — Risk Scoring.</strong> Enter telematics scores and static questionnaire. Click <em>Compute Risk Score</em> to see the Profile verdict. No premium is calculated here — proceed to Stage 3 for pricing.
+        {sharedFleetInfo?.fleet_name && <span style={{ marginLeft: "12px", color: "#5C6570" }}>Fleet: <strong>{sharedFleetInfo.fleet_name}</strong></span>}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+        <div style={cardStyle}>
+          <div style={sectionLabel}>Telematics Behavioural Scores (0 – 100)</div>
+          {numInput("Fatigue / HOS (weight 20%)", "fatigue_hos")}
+          {numInput("Speeding (weight 15%)", "speeding")}
+          {numInput("Cellphone Usage (weight 15%)", "cellphone_usage")}
+          {numInput("Safety Belt Compliance (weight 10%)", "safety_belt_compliance")}
+          {numInput("Driver Behaviour Composite (weight 10%)", "driver_behaviour_composite")}
+          {numInput("Distance Index (weight 8%)", "distance_index")}
+          {numInput("Device Integrity (weight 7%)", "device_integrity")}
+          {numInput("Time on Road (weight 3%)", "time_on_road")}
+          {numInput("Night Driving Ratio (weight 2%)", "night_driving_ratio")}
+        </div>
+
+        <div>
+          <div style={cardStyle}>
+            <div style={sectionLabel}>Modifiers</div>
+            {numInput("Device Concealment Events / month", "device_concealment_events_per_month", 9999)}
+            {numInput("Avg km / vehicle / month", "avg_km_per_vehicle_month", 99999)}
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 600, color: "#14213D", marginBottom: "3px" }}>Trend</label>
+              <select value={f.trend} onChange={e => update("trend", e.target.value)}
+                style={{ width: "100%", padding: "7px 10px", border: "1px solid #C8D0DC", borderRadius: "5px", fontSize: "0.9rem" }}>
+                <option value="improving_strongly">Improving strongly (−15%)</option>
+                <option value="improving_slightly">Improving slightly (−5%)</option>
+                <option value="stable">Stable (0%)</option>
+                <option value="deteriorating_slightly">Deteriorating slightly (+10%)</option>
+                <option value="deteriorating_3plus_months">Deteriorating 3+ months (+20%)</option>
+              </select>
+            </div>
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 600, color: "#14213D", marginBottom: "3px" }}>Data Source (qualifier)</label>
+              <select value={f.data_source} onChange={e => update("data_source", e.target.value)}
+                style={{ width: "100%", padding: "7px 10px", border: "1px solid #C8D0DC", borderRadius: "5px", fontSize: "0.9rem" }}>
+                <option value="none">No telematics — Profile B cap (1.40×)</option>
+                <option value="oem_only">Fleetboard / OEM only — 61.2% coverage, Profile B cap (1.40×)</option>
+                <option value="oem_video">Fleetboard + driver-facing video — 96.2% coverage, Profile A eligible (0.70×)</option>
+              </select>
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={sectionLabel}>Static Questionnaire (7 items, 10% weight)</div>
+            {STATIC_LABELS.map((lbl, i) => {
+              const key = `static_q${i+1}`;
+              return (
+                <div key={key} style={{ marginBottom: "8px" }}>
+                  <label style={{ display: "block", fontSize: "0.80rem", color: "#14213D", marginBottom: "2px" }}>{lbl}</label>
+                  <select value={f[key]} onChange={e => update(key, e.target.value)}
+                    style={{ width: "100%", padding: "6px 8px", border: "1px solid #C8D0DC", borderRadius: "5px", fontSize: "0.85rem" }}>
+                    {STATIC_OPTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ textAlign: "center", margin: "20px 0" }}>
+        <button className="tx-btn"
+          style={{ background: "#14213D", color: "#FAF7F0", padding: "12px 36px", fontSize: "1rem", fontWeight: 700, borderRadius: "6px", border: "none", cursor: "pointer", marginRight: "12px" }}
+          onClick={() => setScored(computeScore())}>
+          Compute Risk Score
+        </button>
+      </div>
+
+      {scored && (
+        <div style={{ ...cardStyle, border: `2px solid ${scored.declines.length > 0 ? "#C0392B" : scored.profile.includes("Profile A") ? "#1A6B3C" : "#B5762A"}`, marginTop: "8px" }}>
+          <div style={{ fontSize: "1.1rem", fontWeight: 700, marginBottom: "12px", color: scored.declines.length > 0 ? "#C0392B" : scored.profile.includes("Profile A") ? "#1A6B3C" : "#B5762A" }}>
+            {scored.declines.length > 0 ? "⛔ AUTO-DECLINE" : scored.profile.includes("Profile A") ? "✅ " + scored.profile : "⚠️ " + scored.profile}
+          </div>
+          {scored.declines.length > 0 && scored.declines.map((d,i) => (
+            <div key={i} style={{ color: "#C0392B", fontSize: "0.9rem", marginBottom: "4px" }}>• {d}</div>
+          ))}
+          {scored.capNote && <div style={{ color: "#B5762A", fontSize: "0.88rem", marginBottom: "10px", fontStyle: "italic" }}>⚠️ {scored.capNote}</div>}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: "12px", marginTop: "12px" }}>
+            {[
+              ["Combined Score", scored.combined],
+              ["Weighted Telematics", scored.weighted],
+              ["Static Score", scored.staticScore],
+              ["Concealment Addition", `+${scored.concAdd}`],
+              ["Trend Addition", scored.trendAdd],
+              ["Rating Factor", scored.factor != null ? `${scored.factor}×` : "N/A"],
+            ].map(([lbl, val]) => (
+              <div key={lbl} style={{ background: "#F5F7FA", borderRadius: "6px", padding: "10px 14px" }}>
+                <div style={{ fontSize: "0.75rem", color: "#5C6570", marginBottom: "2px" }}>{lbl}</div>
+                <div style={{ fontWeight: 700, fontSize: "1.1rem", color: "#14213D" }}>{val}</div>
+              </div>
+            ))}
+          </div>
+          {scored.declines.length === 0 && (
+            <div style={{ textAlign: "center", marginTop: "20px" }}>
+              <button className="tx-btn"
+                style={{ background: "#B5762A", color: "#fff", padding: "10px 32px", fontSize: "0.95rem", fontWeight: 700, borderRadius: "6px", border: "none", cursor: "pointer" }}
+                onClick={onProceedToPricing}>
+                Proceed to Pricing →
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function TelematixRater() {
   const [status, setStatus] = useState("idle"); // idle | reading | extracting | done | error
-  const [mode, setMode] = useState("hcv"); // hcv | hcv_rating | git | fleet_info
+  const [mode, setMode] = useState("fleet_info"); // hcv | hcv_rating | git | fleet_info | multi_cohort | risk_scoring
+  const [riskScoreResult, setRiskScoreResult] = useState(null);
   const [sharedFleetInfo, setSharedFleetInfo] = useState(null);
   const [fileName, setFileName] = useState(null);
   const [extracted, setExtracted] = useState(null);
@@ -2126,81 +2527,102 @@ export default function TelematixRater() {
               lineHeight: 1.15,
             }}
           >
-            HCV / GIT Fleet Risk & Multi-Cohort Rater
+            TelematiX — Stream 2 Virtual Underwriter
           </h1>
+          {/* pipeline-v3 */}
           <p style={{ color: "#5C6570", fontSize: "0.95rem", marginTop: "8px", marginBottom: 0 }}>
-            Capture fleet details once in Fleet Information to pre-fill HCV Rating, GIT Quoting, and Multi-Cohort —
-            or upload a document for automated risk scoring. Extraction and scoring always run separately, the rating is never guessed by the model.
+            One pipeline: Intake → Risk Scoring → Pricing, branching by asset class. [v3] Capture fleet details once in Fleet Information to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
           </p>
         </div>
 
-        {/* Mode tabs */}
-        <div style={{ display: "flex", gap: "8px", marginBottom: "28px", flexWrap: "wrap" }}>
-          <button
-            className="tx-btn"
-            onClick={() => setMode("hcv")}
-            style={{
-              ...tabBtnStyle,
-              background: mode === "hcv" ? "#14213D" : "transparent",
-              color: mode === "hcv" ? "#FAF7F0" : "#14213D",
-            }}
-          >
-            Telematix Report
-          </button>
-          <button
-            className="tx-btn"
-            onClick={() => setMode("hcv_rating")}
-            style={{
-              ...tabBtnStyle,
-              background: mode === "hcv_rating" ? "#14213D" : "transparent",
-              color: mode === "hcv_rating" ? "#FAF7F0" : "#14213D",
-            }}
-          >
-            HCV Rating
-          </button>
-          <button
-            className="tx-btn"
-            onClick={() => setMode("git")}
-            style={{
-              ...tabBtnStyle,
-              background: mode === "git" ? "#14213D" : "transparent",
-              color: mode === "git" ? "#FAF7F0" : "#14213D",
-            }}
-          >
-            GIT Quoting
-          </button>
-          <button
-            className="tx-btn"
+        {/* ── 3-Stage pipeline progress bar ── */}
+        <div style={{ display: "flex", alignItems: "center", marginBottom: "20px", borderRadius: "6px", overflow: "hidden", border: "1px solid #C8D0DC" }}>
+          <div
             onClick={() => setMode("fleet_info")}
             style={{
-              ...tabBtnStyle,
-              background: mode === "fleet_info" ? "#14213D" : "transparent",
-              color: mode === "fleet_info" ? "#FAF7F0" : "#14213D",
+              flex: 1, padding: "11px 14px", textAlign: "center", cursor: "pointer",
+              background: (mode === "fleet_info" || mode === "hcv") ? "#14213D" : "#E8EDF5",
+              color: (mode === "fleet_info" || mode === "hcv") ? "#FAF7F0" : "#5C6570",
+              fontWeight: (mode === "fleet_info" || mode === "hcv") ? 700 : 500,
+              fontSize: "0.88rem", borderRight: "1px solid #C8D0DC",
             }}
           >
-            Fleet Information
-          </button>
-          <button
-            className="tx-btn"
+            1 · Intake
+          </div>
+          <div
+            onClick={() => setMode("risk_scoring")}
+            style={{
+              flex: 1, padding: "11px 14px", textAlign: "center", cursor: "pointer",
+              background: mode === "risk_scoring" ? "#14213D" : "#E8EDF5",
+              color: mode === "risk_scoring" ? "#FAF7F0" : "#5C6570",
+              fontWeight: mode === "risk_scoring" ? 700 : 500,
+              fontSize: "0.88rem", borderRight: "1px solid #C8D0DC",
+            }}
+          >
+            2 · Risk Scoring
+          </div>
+          <div
             onClick={() => setMode("multi_cohort")}
             style={{
-              ...tabBtnStyle,
-              background: mode === "multi_cohort" ? "#14213D" : "transparent",
-              color: mode === "multi_cohort" ? "#FAF7F0" : "#14213D",
+              flex: 1, padding: "11px 14px", textAlign: "center", cursor: "pointer",
+              background: (mode === "multi_cohort" || mode === "hcv_rating" || mode === "git") ? "#14213D" : "#E8EDF5",
+              color: (mode === "multi_cohort" || mode === "hcv_rating" || mode === "git") ? "#FAF7F0" : "#5C6570",
+              fontWeight: (mode === "multi_cohort" || mode === "hcv_rating" || mode === "git") ? 700 : 500,
+              fontSize: "0.88rem",
             }}
           >
-            Multi-Cohort
-          </button>
+            3 · Pricing
+          </div>
         </div>
 
-        {mode === "multi_cohort" ? (
+        {/* ── Sub-tool row per stage ── */}
+        <div style={{ display: "flex", gap: "8px", marginBottom: "28px", flexWrap: "wrap" }}>
+          {(mode === "fleet_info" || mode === "hcv") && (
+            <>
+              <button className="tx-btn" onClick={() => setMode("fleet_info")}
+                style={{ ...tabBtnStyle, background: mode === "fleet_info" ? "#14213D" : "transparent", color: mode === "fleet_info" ? "#FAF7F0" : "#14213D" }}>
+                Fleet Information
+              </button>
+              <button className="tx-btn" onClick={() => setMode("hcv")}
+                style={{ ...tabBtnStyle, background: mode === "hcv" ? "#14213D" : "transparent", color: mode === "hcv" ? "#FAF7F0" : "#14213D" }}>
+                Analyse Existing Policy
+              </button>
+            </>
+          )}
+          {mode === "risk_scoring" && (
+            <button className="tx-btn" onClick={() => setMode("risk_scoring")}
+              style={{ ...tabBtnStyle, background: "#14213D", color: "#FAF7F0" }}>
+              HCV Risk Score
+            </button>
+          )}
+          {(mode === "multi_cohort" || mode === "hcv_rating" || mode === "git") && (
+            <>
+              <button className="tx-btn" onClick={() => setMode("multi_cohort")}
+                style={{ ...tabBtnStyle, background: mode === "multi_cohort" ? "#14213D" : "transparent", color: mode === "multi_cohort" ? "#FAF7F0" : "#14213D" }}>
+                Multi-Cohort
+              </button>
+              <button className="tx-btn" onClick={() => setMode("hcv_rating")}
+                style={{ ...tabBtnStyle, background: mode === "hcv_rating" ? "#14213D" : "transparent", color: mode === "hcv_rating" ? "#FAF7F0" : "#14213D" }}>
+                HCV Rating
+              </button>
+              <button className="tx-btn" onClick={() => setMode("git")}
+                style={{ ...tabBtnStyle, background: mode === "git" ? "#14213D" : "transparent", color: mode === "git" ? "#FAF7F0" : "#14213D" }}>
+                GIT Quoting
+              </button>
+            </>
+          )}
+        </div>
+
+        {mode === "risk_scoring" ? (
+          <RiskScoringView sharedFleetInfo={sharedFleetInfo} onProceedToPricing={() => setMode("multi_cohort")} />
+        ) : mode === "multi_cohort" ? (
           <MultiCohortView sharedFleetInfo={sharedFleetInfo} />
         ) : mode === "git" ? (
           <GitQuotingView sharedFleetInfo={sharedFleetInfo} />
         ) : mode === "hcv_rating" ? (
           <HcvRatingView sharedFleetInfo={sharedFleetInfo} />
         ) : mode === "fleet_info" ? (
-          <FleetInformationView sharedFleetInfo={sharedFleetInfo} onSave={setSharedFleetInfo} />
+          <FleetInformationView sharedFleetInfo={sharedFleetInfo} onSave={(info) => { setSharedFleetInfo(info); setMode("risk_scoring"); }} />
         ) : (
           <>
         {/* Upload zone */}

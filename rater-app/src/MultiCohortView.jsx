@@ -6,6 +6,7 @@ import {
   classifyExclusion,
   ORCA_TRACKING_RULES,
 } from "./orcaUnderwritingRules.js";
+import { computePlantRatingFactor, computeAgriRatingFactor } from "./plantAgriEngine.js";
 
 /**
  * MultiCohortView
@@ -102,6 +103,85 @@ const ASSET_CLASS_LABELS = {
   drone_commercial: "Drone / Commercial",
 };
 
+// HCV asset classes — these get the Fleetboard data-source qualifier applied.
+// GIT and specialist classes (Plant, Agri) are priced through their own paths.
+const HCV_ASSET_CLASSES = new Set([
+  "hcv_general_freight",
+  "fuel_hazmat_tanker",
+  "minerals_bulk_long_haul",
+  "fmcg_distribution",
+  "bulk_liquids_non_hazmat",
+]);
+
+// Data-source qualifier constants (Frans-confirmed Aug 2026 — TelematiX_Ingestion_Matrix.xlsx)
+const HCV_QUALIFIER = {
+  none:      { factor: 1.40, coverage: 0.0,   label: "No telematics — Profile B cap (1.40×)",                         color: "#B5762A" },
+  oem_only:  { factor: 1.40, coverage: 0.612, label: "Fleetboard / OEM only — 61.2% coverage, Profile B cap (1.40×)", color: "#B5762A" },
+  oem_video: { factor: 0.70, coverage: 0.962, label: "Fleetboard + video — 96.2% coverage, Profile A eligible (0.70×)", color: "#2E6B3E" },
+};
+// HCV pricing constants (mirrored from TelematixRater.jsx scoring engine)
+const HCV_MANUFACTURER_LOADINGS = {
+  mercedes_benz: 0.00, volvo: -0.03, freightliner: -0.10,
+  scania: 0.14, faw: 0.10, man_daf: 0.08, western_star: 0.15,
+};
+const HCV_AGE_BAND_LOADINGS = {
+  under_3yr: 0.05, "3_to_5yr": 0.12, "6_to_8yr": 0.22,
+  "9_to_11yr": 0.28, "12_to_15yr": 0.15, over_15yr: 0.20,
+};
+const HCV_BASE_RATE = 0.045;
+const HCV_MIN_ANNUAL_PREMIUM = 5000;
+
+function classifyHcvAgeBandMC(yearModel) {
+  const age = new Date().getFullYear() - (yearModel || 2020);
+  if (age < 3)  return "under_3yr";
+  if (age < 6)  return "3_to_5yr";
+  if (age < 9)  return "6_to_8yr";
+  if (age < 12) return "9_to_11yr";
+  if (age < 16) return "12_to_15yr";
+  return "over_15yr";
+}
+
+function priceHcvCohort(cohort) {
+  const count = cohort.vehicle_count || 0;
+  const siPerVeh = cohort.hcv_sum_insured_per_vehicle || 0;
+  const sumInsured = siPerVeh * count;
+
+  if (sumInsured <= 0 || count <= 0) {
+    return { ...cohort, status: "REFER", referral_reason: "Enter sum insured per vehicle and vehicle count to price this cohort.", cohort_monthly: null, cohort_annual: null };
+  }
+
+  // Loss ratio gate (65% threshold — Frans/Hollard confirmed)
+  const lr = cohort.hcv_loss_ratio_pct;
+  if (lr != null && lr > 65 && !cohort.hcv_loss_ratio_override_approver) {
+    return { ...cohort, status: "REFER", referral_reason: `Loss ratio ${lr.toFixed(1)}% exceeds 65% threshold. Enter approver name to override.`, cohort_monthly: null, cohort_annual: null };
+  }
+
+  const ds = cohort.hcv_data_source || "none";
+  const qual = HCV_QUALIFIER[ds] || HCV_QUALIFIER.none;
+  const mfr = cohort.hcv_manufacturer || "mercedes_benz";
+  const mfrLoad = HCV_MANUFACTURER_LOADINGS[mfr] ?? 0;
+  const ageBand = classifyHcvAgeBandMC(cohort.hcv_year_model);
+  const ageLoad = HCV_AGE_BAND_LOADINGS[ageBand] ?? 0;
+
+  let annual = sumInsured * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qual.factor;
+  let minApplied = false;
+  if (annual < HCV_MIN_ANNUAL_PREMIUM) { annual = HCV_MIN_ANNUAL_PREMIUM; minApplied = true; }
+
+  return {
+    ...cohort,
+    status: "QUOTABLE",
+    hcv_qualifier: qual,
+    hcv_age_band: ageBand,
+    hcv_manufacturer_loading: mfrLoad,
+    hcv_age_loading: ageLoad,
+    total_sum_insured: sumInsured,
+    cohort_monthly: Math.round(annual / 12 * 100) / 100,
+    cohort_annual:  Math.round(annual * 100) / 100,
+    min_premium_applied: minApplied,
+  };
+}
+
+
 // ============================================================================
 // Pricing helper — same logic as computeGitPvpm in monolith, but per-cohort
 // ============================================================================
@@ -155,7 +235,74 @@ function computeIotCreditStack(iotDevices, cargosnapFitted, rmpTier) {
   return { total_credit: capped, uncapped: total, detail, capped: capped !== total };
 }
 
-function priceCohort(cohort, sharedFields) {
+// Base rates for Plant/Agri (per annum, as % of declared machine value)
+const PLANT_BASE_RATE = 0.020;  // 2.0% p.a. of declared value
+const AGRI_BASE_RATE  = 0.016;  // 1.6% p.a. of declared value
+const PLANT_AGRI_MIN_ANNUAL = 5000; // R5,000 minimum annual premium
+
+function pricePlantCohort(cohort) {
+  const machineVal = Number(cohort.machine_value_per_unit) || 0;
+  const count = Number(cohort.vehicle_count) || 0;
+  if (!machineVal || !count) {
+    return { ...cohort, status: "REFER", referral_reason: "Machine value and unit count are required for Yellow Metal / Plant rating." };
+  }
+  const qualify = computePlantRatingFactor(cohort.plant_data_source || "oemOnly");
+  if (qualify.factor >= 2.0) {
+    return { ...cohort, status: "REFER", referral_reason: `Data coverage insufficient for Plant rating (coverage ${Math.round(qualify.coverage * 100)}% — minimum 50% required). Fit an insurance-approved SVR unit alongside the OEM device.`, qualify };
+  }
+  const annualPremiumPerUnit = machineVal * PLANT_BASE_RATE * qualify.factor;
+  let annualPremium = annualPremiumPerUnit * count;
+  let minPremiumApplied = false;
+  if (annualPremium < PLANT_AGRI_MIN_ANNUAL) { annualPremium = PLANT_AGRI_MIN_ANNUAL; minPremiumApplied = true; }
+  const monthlyPremium = annualPremium / 12;
+  return {
+    ...cohort,
+    status: "QUOTABLE",
+    qualify,
+    base_rate: PLANT_BASE_RATE,
+    rating_factor: qualify.factor,
+    profile: qualify.profile,
+    machine_value_per_unit: machineVal,
+    annual_premium_per_unit: Math.round(annualPremiumPerUnit * 100) / 100,
+    cohort_monthly: Math.round(monthlyPremium * 100) / 100,
+    cohort_annual: Math.round(annualPremium * 100) / 100,
+    min_premium_applied: minPremiumApplied,
+  };
+}
+
+function priceAgriCohort(cohort) {
+  const machineVal = Number(cohort.machine_value_per_unit) || 0;
+  const count = Number(cohort.vehicle_count) || 0;
+  const machineType = cohort.agri_machine_type || "tractor";
+  if (!machineVal || !count) {
+    return { ...cohort, status: "REFER", referral_reason: "Machine value and unit count are required for Agricultural Equipment rating." };
+  }
+  const qualify = computeAgriRatingFactor(machineType, cohort.agri_data_source || "oemOnly");
+  if (qualify.factor >= 2.0) {
+    return { ...cohort, status: "REFER", referral_reason: `Data coverage insufficient for Agri rating (${machineType}, coverage ${Math.round(qualify.coverage * 100)}%). Fit approved fire suppression and SVR to reach minimum coverage threshold.`, qualify };
+  }
+  const annualPremiumPerUnit = machineVal * AGRI_BASE_RATE * qualify.factor;
+  let annualPremium = annualPremiumPerUnit * count;
+  let minPremiumApplied = false;
+  if (annualPremium < PLANT_AGRI_MIN_ANNUAL) { annualPremium = PLANT_AGRI_MIN_ANNUAL; minPremiumApplied = true; }
+  const monthlyPremium = annualPremium / 12;
+  return {
+    ...cohort,
+    status: "QUOTABLE",
+    qualify,
+    base_rate: AGRI_BASE_RATE,
+    rating_factor: qualify.factor,
+    profile: qualify.profile,
+    machine_type: machineType,
+    machine_value_per_unit: machineVal,
+    annual_premium_per_unit: Math.round(annualPremiumPerUnit * 100) / 100,
+    cohort_monthly: Math.round(monthlyPremium * 100) / 100,
+    cohort_annual: Math.round(annualPremium * 100) / 100,
+    min_premium_applied: minPremiumApplied,
+  };
+}
+
+function priceGitCohort(cohort, sharedFields) {
   const loadResult = gitLoadLimitBandPvpm(cohort.load_limit_per_vehicle, cohort.manual_override_pvpm);
   if (loadResult.referral) {
     return {
@@ -168,7 +315,6 @@ function priceCohort(cohort, sharedFields) {
       cohort_annual: null,
     };
   }
-
   const basePvpm = loadResult.pvpm;
   const geo = GIT_GEOGRAPHIC_ZONE_LOADING[sharedFields.geographic_zone] ?? 1.0;
   const claims = GIT_CLAIMS_HISTORY_LOADING[sharedFields.claims_history] ?? 1.0;
@@ -176,27 +322,22 @@ function priceCohort(cohort, sharedFields) {
   const night = GIT_NIGHT_OPS_LOADING[sharedFields.night_ops] ?? 1.0;
   const cross = GIT_CROSS_BORDER_LOADING[sharedFields.cross_border] ?? 1.0;
   let loadedPvpm = basePvpm * geo * claims * age * night * cross;
-
   const restricted = GIT_RESTRICTED_COVER_FACTORS[sharedFields.cover_type] ?? 1.0;
   loadedPvpm *= restricted;
-
   const iot = computeIotCreditStack(
     sharedFields.iot_devices_fitted || [],
     sharedFields.cargosnap_fitted || false,
     sharedFields.cvtscpi_rmp_tier || "none"
   );
   const finalPvpm = loadedPvpm + loadedPvpm * iot.total_credit;
-
   let monthlyPremium = finalPvpm * cohort.vehicle_count;
   let annualPremium = monthlyPremium * 12;
   let minPremiumApplied = false;
-
   if (annualPremium < GIT_MIN_ANNUAL_PREMIUM) {
     annualPremium = GIT_MIN_ANNUAL_PREMIUM;
     monthlyPremium = GIT_MIN_ANNUAL_PREMIUM / 12;
     minPremiumApplied = true;
   }
-
   return {
     ...cohort,
     status: "QUOTABLE",
@@ -212,6 +353,14 @@ function priceCohort(cohort, sharedFields) {
     loadings: { geo, claims, age, night, cross, restricted },
     multiplier: Math.round((finalPvpm / basePvpm) * 100) / 100,
   };
+}
+
+function priceCohort(cohort, sharedFields) {
+  const cls = cohort.asset_class || "hcv_general_freight";
+  if (cls === "yellow_metal_plant") return pricePlantCohort(cohort);
+  if (cls === "agricultural_equipment") return priceAgriCohort(cohort);
+  if (HCV_ASSET_CLASSES.has(cls)) return priceHcvCohort(cohort, sharedFields);
+  return priceGitCohort(cohort, sharedFields);
 }
 
 // ============================================================================
@@ -233,6 +382,20 @@ function makeCohort(index, shared) {
     goods_is_livestock: false,
     tracking_device_vendor: "",
     tracking_device_category: "",
+    // Plant / Yellow Metal fields
+    plant_data_source: "oemOnly",
+    machine_value_per_unit: 0,
+    // Agri fields
+    agri_machine_type: "tractor",
+    agri_data_source: "oemOnly",
+    // HCV-specific fields
+    hcv_sum_insured_per_vehicle: 0,
+    hcv_manufacturer: "mercedes_benz",
+    hcv_year_model: new Date().getFullYear(),
+    hcv_data_source: "oem_only",
+    hcv_loss_ratio_pct: null,
+    hcv_loss_ratio_override_approver: "",
+    hcv_loss_ratio_override_reason: "",
   };
 }
 
@@ -309,6 +472,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
     iot_devices_fitted: shared.iot_devices_fitted || [],
     cargosnap_fitted: shared.cargosnap_fitted || false,
     cvtscpi_rmp_tier: shared.cvtscpi_rmp_tier || "none",
+    // HCV data-source qualifier (Frans-confirmed Aug 2026)
+    hcv_data_source: shared.hcv_data_source || "none",
   }), [shared]);
 
   // Price all cohorts
@@ -342,6 +507,9 @@ export default function MultiCohortView({ sharedFleetInfo }) {
     const totalMonthly = quotable.reduce((s, c) => s + (c.cohort_monthly || 0), 0);
     const totalAnnual = quotable.reduce((s, c) => s + (c.cohort_annual || 0), 0);
     const totalVehicles = quotable.reduce((s, c) => s + c.vehicle_count, 0);
+    // Bug fix #6: track referred vehicle count separately so it's visible in
+    // the summary rather than silently dropped from the fleet total.
+    const referredVehicles = referred.reduce((s, c) => s + (c.vehicle_count || 0), 0);
 
     // Weighted multiplier across quotable cohorts
     let weightedMult = 1.0;
@@ -354,6 +522,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
       totalMonthly: Math.round(totalMonthly * 100) / 100,
       totalAnnual: Math.round(totalAnnual * 100) / 100,
       totalVehicles,
+      referredVehicles,
       cohortCount: pricedCohorts.length,
       quotableCount: quotable.length,
       referredCount: referred.length,
@@ -452,7 +621,14 @@ export default function MultiCohortView({ sharedFleetInfo }) {
           </div>
           <div style={statBoxStyle}>
             <div style={statLabel}>Total vehicles</div>
-            <div style={statValue}>{fleetSummary.totalVehicles}</div>
+            <div style={statValue}>
+              {fleetSummary.totalVehicles}
+              {fleetSummary.referredVehicles > 0 && (
+                <span style={{ color: "#B23A2E", fontSize: "0.8rem", marginLeft: "6px" }}>
+                  +{fleetSummary.referredVehicles} referred
+                </span>
+              )}
+            </div>
           </div>
           <div style={statBoxStyle}>
             <div style={statLabel}>Weighted multiplier</div>
@@ -519,7 +695,9 @@ export default function MultiCohortView({ sharedFleetInfo }) {
       {pricedCohorts.map((cohort, idx) => {
         const isExpanded = expandedCohort === idx;
         const isReferred = cohort.status === "REFER";
-        const needsOverride = isReferred && cohort.load_limit_per_vehicle < GIT_LOAD_LIMIT_MIN_RAND;
+        const isPlantAgri = cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment";
+        const isHcv = HCV_ASSET_CLASSES.has(cohort.asset_class);
+        const needsOverride = isReferred && !isPlantAgri && !isHcv && cohort.load_limit_per_vehicle < GIT_LOAD_LIMIT_MIN_RAND;
 
         return (
           <div
@@ -560,7 +738,9 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                   {" · "}
                   {ASSET_CLASS_LABELS[cohort.asset_class] || cohort.asset_class?.replace(/_/g, " ")}
                   {" · "}
-                  R{(cohort.load_limit_per_vehicle || 0).toLocaleString()} load limit
+                  {isPlantAgri
+                    ? `R${(cohort.machine_value_per_unit || 0).toLocaleString()} /machine`
+                    : `R${(cohort.load_limit_per_vehicle || 0).toLocaleString()} load limit`}
                 </div>
               </div>
               <div style={{ textAlign: "right" }}>
@@ -577,8 +757,12 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                     : `R${cohort.cohort_monthly.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo`}
                 </div>
                 {!isReferred && (
-                  <div style={{ fontSize: "0.72rem", color: "#B5762A" }}>
-                    {cohort.multiplier.toFixed(2)}x · R{cohort.final_pvpm.toFixed(2)}/veh
+                  <div style={{ fontSize: "0.72rem", color: cohort.hcv_qualifier ? cohort.hcv_qualifier.color : "#B5762A" }}>
+                    {cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment"
+                      ? `${cohort.rating_factor?.toFixed(2)}x · ${cohort.profile}`
+                      : HCV_ASSET_CLASSES.has(cohort.asset_class)
+                      ? `${cohort.hcv_qualifier?.factor?.toFixed(2)}× qualifier · R${cohort.final_pvpm?.toFixed(2)}/veh`
+                      : `${cohort.multiplier?.toFixed(2)}x · R${cohort.final_pvpm?.toFixed(2)}/veh`}
                   </div>
                 )}
                 <div style={{ fontSize: "0.62rem", color: "#999", marginTop: "2px" }}>
@@ -603,6 +787,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       ))}
                     </select>
                   </div>
+                  {!isPlantAgri && (
                   <div>
                     <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Commodity type</div>
                     <select
@@ -615,34 +800,142 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       ))}
                     </select>
                   </div>
+                  )}
                   <div>
                     <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Vehicle count</div>
                     <input
                       type="number"
                       min="0"
-                      value={cohort.vehicle_count}
+                      // Bug fix #5: show empty string when 0 so the user starts
+                      // with a blank field — prevents the "07 vehicles" leading
+                      // zero display when typing into a zero-initialised input.
+                      value={cohort.vehicle_count === 0 ? "" : cohort.vehicle_count}
+                      placeholder="0"
                       onFocus={(e) => setTimeout(() => e.target.select(), 0)}
-                      onChange={(e) => updateCohort(cohort.id, "vehicle_count", Number(e.target.value))}
+                      onChange={(e) => updateCohort(cohort.id, "vehicle_count", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
                       onWheel={(e) => e.target.blur()}
                       style={inputStyle}
                     />
                   </div>
-                  <div>
-                    <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Load limit per vehicle (R)</div>
-                    <input
-                      type="number"
-                      min="0"
-                      step="10000"
-                      value={cohort.load_limit_per_vehicle}
-                      onFocus={(e) => setTimeout(() => e.target.select(), 0)}
-                      onChange={(e) => updateCohort(cohort.id, "load_limit_per_vehicle", Number(e.target.value))}
-                      onWheel={(e) => e.target.blur()}
-                      style={inputStyle}
-                    />
-                  </div>
+                  {!isPlantAgri && !isHcv && (
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Load limit per vehicle (R)</div>
+                      <input
+                        type="number"
+                        min="0"
+                        step="10000"
+                        value={cohort.load_limit_per_vehicle === 0 ? "" : cohort.load_limit_per_vehicle}
+                        placeholder="0"
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "load_limit_per_vehicle", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
+                        onWheel={(e) => e.target.blur()}
+                        style={inputStyle}
+                      />
+                    </div>
+                  )}
+                  {isHcv && (
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Sum insured per vehicle (R)</div>
+                      <input
+                        type="number"
+                        min="0"
+                        step="10000"
+                        value={cohort.hcv_sum_insured_per_vehicle === 0 ? "" : cohort.hcv_sum_insured_per_vehicle}
+                        placeholder="0"
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "hcv_sum_insured_per_vehicle", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
+                        onWheel={(e) => e.target.blur()}
+                        style={inputStyle}
+                      />
+                    </div>
+                  )}
+                  {(cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment") && (
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Declared value per machine (R)</div>
+                      <input
+                        type="number"
+                        min="0"
+                        step="10000"
+                        value={cohort.machine_value_per_unit === 0 ? "" : cohort.machine_value_per_unit}
+                        placeholder="0"
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "machine_value_per_unit", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
+                        onWheel={(e) => e.target.blur()}
+                        style={inputStyle}
+                      />
+                    </div>
+                  )}
                 </div>
 
-                {/* ORCA Underwriting Panel */}
+                {/* HCV-specific fields */}
+                {isHcv && (
+                <div style={{ marginTop: "14px", padding: "12px 14px", background: "#F1ECE0", borderRadius: "6px", borderLeft: "3px solid #14213D" }}>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#14213D", marginBottom: "10px" }}>HCV Underwriting</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Data source (qualifier)</div>
+                      <select value={cohort.hcv_data_source || "oem_only"} onChange={(e) => updateCohort(cohort.id, "hcv_data_source", e.target.value)} style={inputStyle}>
+                        <option value="none">No telematics — Profile B cap (1.40×)</option>
+                        <option value="oem_only">Fleetboard / OEM only — 61.2% coverage (1.40×)</option>
+                        <option value="oem_video">Fleetboard + video — 96.2% coverage, Profile A eligible (0.70×)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Manufacturer</div>
+                      <select value={cohort.hcv_manufacturer || "mercedes_benz"} onChange={(e) => updateCohort(cohort.id, "hcv_manufacturer", e.target.value)} style={inputStyle}>
+                        <option value="mercedes_benz">Mercedes-Benz (0%)</option>
+                        <option value="volvo">Volvo (−3%)</option>
+                        <option value="freightliner">Freightliner (−10%)</option>
+                        <option value="scania">Scania (+14%)</option>
+                        <option value="faw">FAW (+10%)</option>
+                        <option value="man_daf">MAN / DAF (+8%)</option>
+                        <option value="western_star">Western Star (+15%)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Average vehicle year model</div>
+                      <input type="number" min="1990" max="2030"
+                        value={cohort.hcv_year_model || new Date().getFullYear()}
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "hcv_year_model", parseInt(e.target.value) || new Date().getFullYear())}
+                        style={inputStyle} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Loss ratio % (leave blank if unknown)</div>
+                      <input type="number" min="0" max="999" placeholder="e.g. 74.2"
+                        value={cohort.hcv_loss_ratio_pct ?? ""}
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "hcv_loss_ratio_pct", e.target.value === "" ? null : parseFloat(e.target.value))}
+                        style={inputStyle} />
+                    </div>
+                  </div>
+                  {cohort.hcv_loss_ratio_pct != null && cohort.hcv_loss_ratio_pct > 65 && (
+                    <div style={{ background: "#FFF3CD", border: "1px solid #B5762A", borderRadius: "5px", padding: "10px 12px", marginTop: "8px" }}>
+                      <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#B5762A", marginBottom: "6px" }}>⚠ Loss Ratio Referral — Management Override Required</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                        <input type="text" placeholder="Approver name"
+                          value={cohort.hcv_loss_ratio_override_approver || ""}
+                          onChange={(e) => updateCohort(cohort.id, "hcv_loss_ratio_override_approver", e.target.value)}
+                          style={inputStyle} />
+                        <input type="text" placeholder="Reason for override"
+                          value={cohort.hcv_loss_ratio_override_reason || ""}
+                          onChange={(e) => updateCohort(cohort.id, "hcv_loss_ratio_override_reason", e.target.value)}
+                          style={inputStyle} />
+                      </div>
+                    </div>
+                  )}
+                  {cohort.hcv_qualifier && (
+                    <div style={{ fontSize: "0.74rem", color: "#5C6570", marginTop: "8px" }}>
+                      <strong>Qualifier:</strong> {cohort.hcv_qualifier.label} · Coverage: {(cohort.hcv_qualifier.coverage * 100).toFixed(1)}%
+                      {cohort.hcv_age_band && <span> · Age band: {cohort.hcv_age_band.replace(/_/g," ")} ({cohort.hcv_age_loading != null ? ((cohort.hcv_age_loading >= 0 ? "+" : "") + (cohort.hcv_age_loading * 100).toFixed(0) + "%") : ""})</span>}
+                      {cohort.hcv_manufacturer_loading != null && <span> · Manufacturer: {((cohort.hcv_manufacturer_loading >= 0 ? "+" : "") + (cohort.hcv_manufacturer_loading * 100).toFixed(0) + "%")}</span>}
+                    </div>
+                  )}
+                </div>
+                )}
+
+                {/* ORCA Underwriting Panel — GIT only */}
+                {!isHcv && cohort.asset_class !== "yellow_metal_plant" && cohort.asset_class !== "agricultural_equipment" && (
                 <div
                   style={{
                     marginTop: "14px",
@@ -736,9 +1029,93 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                     )}
                   </div>
                 </div>
+                )}
 
-                {/* Below-R50k override */}
-                {needsOverride && (
+                {/* ORCA Underwriting Panel — Plant / Yellow Metal */}
+                {cohort.asset_class === "yellow_metal_plant" && (
+                <div
+                  style={{
+                    marginTop: "14px",
+                    padding: "12px 14px",
+                    background: "#F1ECE0",
+                    borderRadius: "6px",
+                    borderLeft: "3px solid #14213D",
+                  }}
+                >
+                  <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#14213D", marginBottom: "10px" }}>
+                    Plant / Yellow Metal — Data Source
+                  </div>
+                  <div style={{ marginBottom: "10px" }}>
+                    <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Telematics data source</div>
+                    <select
+                      value={cohort.plant_data_source}
+                      onChange={(e) => updateCohort(cohort.id, "plant_data_source", e.target.value)}
+                      style={inputStyle}
+                    >
+                      <option value="oemOnly">OEM only (VisionLink / KOMTRAX / CareTrack — no SVR)</option>
+                      <option value="oemSvr">OEM + insurance-approved SVR fitted</option>
+                    </select>
+                  </div>
+                  <div style={{ fontSize: "0.74rem", color: "#5C6570", lineHeight: 1.6 }}>
+                    <div><strong>Coverage:</strong> {cohort.plant_data_source === "oemSvr" ? "94.5% — Profile A eligible (0.70×)" : "60.2% — Profile B partial (1.40×)"}</div>
+                    <div><strong>Base rate:</strong> 2.0% p.a. of declared machine value</div>
+                    <div style={{ marginTop: "4px", color: "#8B6914", fontSize: "0.7rem" }}>
+                      Note: OEM telematics gives location only — full theft credit requires an approved SVR unit alongside the OEM feed.
+                    </div>
+                  </div>
+                </div>
+                )}
+
+                {/* ORCA Underwriting Panel — Agricultural Equipment */}
+                {cohort.asset_class === "agricultural_equipment" && (
+                <div
+                  style={{
+                    marginTop: "14px",
+                    padding: "12px 14px",
+                    background: "#F1ECE0",
+                    borderRadius: "6px",
+                    borderLeft: "3px solid #14213D",
+                  }}
+                >
+                  <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#14213D", marginBottom: "10px" }}>
+                    Agricultural Equipment — Machine Type & Data Source
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Machine type</div>
+                      <select
+                        value={cohort.agri_machine_type}
+                        onChange={(e) => updateCohort(cohort.id, "agri_machine_type", e.target.value)}
+                        style={inputStyle}
+                      >
+                        <option value="combine">Combine harvester</option>
+                        <option value="tractor">Tractor</option>
+                        <option value="sprayer">Sprayer</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Telematics / fitment</div>
+                      <select
+                        value={cohort.agri_data_source}
+                        onChange={(e) => updateCohort(cohort.id, "agri_data_source", e.target.value)}
+                        style={inputStyle}
+                      >
+                        <option value="oemOnly">OEM only (no suppression, no SVR)</option>
+                        <option value="fullFit">Full fit (fire suppression + SVR)</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: "0.74rem", color: "#5C6570", lineHeight: 1.6 }}>
+                    <div><strong>Base rate:</strong> 1.6% p.a. of declared machine value</div>
+                    <div style={{ marginTop: "4px", color: "#8B6914", fontSize: "0.7rem" }}>
+                      Dual gate: both fire suppression AND SVR are required to clear the two hard gates and reach Profile A. Only a fully-fitted combine can reach Profile A (0.70×) — tractors and sprayers top out at Profile B upper (1.10×) even when fully fitted.
+                    </div>
+                  </div>
+                </div>
+                )}
+
+                {/* Below-R50k override — GIT only */}
+                {!isHcv && needsOverride && (
                   <div
                     style={{
                       marginTop: "14px",
@@ -806,35 +1183,76 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                     <div style={{ marginBottom: "6px" }}>
                       <strong style={{ color: "#14213D" }}>Pricing breakdown</strong>
                     </div>
-                    <div>Base PVPM: R{cohort.base_pvpm?.toFixed(2)}</div>
-                    <div>
-                      Loadings: geo {cohort.loadings.geo.toFixed(2)}x · claims {cohort.loadings.claims.toFixed(2)}x
-                      · age {cohort.loadings.age.toFixed(2)}x · night {cohort.loadings.night.toFixed(2)}x
-                      · border {cohort.loadings.cross.toFixed(2)}x · cover {cohort.loadings.restricted.toFixed(2)}x
-                    </div>
-                    <div>Loaded PVPM: R{cohort.loaded_pvpm?.toFixed(2)}</div>
-                    <div>
-                      IoT adjustment: {(cohort.iot_credit?.total_credit * 100).toFixed(0)}%
-                      {cohort.iot_credit?.capped ? " (capped at -40%)" : ""}
-                    </div>
-                    <div>Final PVPM: R{cohort.final_pvpm?.toFixed(2)}</div>
-                    <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
-                      <strong>
-                        R{cohort.final_pvpm?.toFixed(2)} × {cohort.vehicle_count} vehicles = R
-                        {cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        /mo
-                      </strong>
-                      {cohort.min_premium_applied && (
-                        <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>
-                      )}
-                      {cohort.override_applied && (
-                        <span style={{ color: "#B23A2E", marginLeft: "8px" }}>(manual override)</span>
-                      )}
-                    </div>
-                    <div>
-                      Annual: R
-                      {cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </div>
+                    {isPlantAgri ? (
+                      <>
+                        <div>Machine value per unit: R{Number(cohort.machine_value_per_unit || 0).toLocaleString()}</div>
+                        <div>Base rate: {((cohort.base_rate || 0) * 100).toFixed(1)}% p.a.</div>
+                        <div>Rating factor: {cohort.rating_factor?.toFixed(2)}x ({cohort.profile})</div>
+                        <div>Annual per unit: R{cohort.annual_premium_per_unit?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                          <strong>
+                            {cohort.vehicle_count} units × R{cohort.annual_premium_per_unit?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/yr
+                            = R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo
+                          </strong>
+                          {cohort.min_premium_applied && (
+                            <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>
+                          )}
+                        </div>
+                        <div>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                      </>
+                    ) : isHcv ? (
+                      <>
+                        <div>Total sum insured: R{cohort.total_sum_insured?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                        <div>Base rate: {(HCV_BASE_RATE * 100).toFixed(1)}% p.a. of sum insured</div>
+                        <div>Manufacturer loading: {cohort.hcv_manufacturer_loading != null ? ((cohort.hcv_manufacturer_loading >= 0 ? "+" : "") + (cohort.hcv_manufacturer_loading * 100).toFixed(0) + "%") : "0%"}</div>
+                        <div>Age band loading: {cohort.hcv_age_band?.replace(/_/g, " ")} — {cohort.hcv_age_loading != null ? ((cohort.hcv_age_loading >= 0 ? "+" : "") + (cohort.hcv_age_loading * 100).toFixed(0) + "%") : "0%"}</div>
+                        <div>Data-source qualifier: {cohort.hcv_qualifier?.factor?.toFixed(2)}× ({cohort.hcv_qualifier?.label})</div>
+                        {cohort.hcv_loss_ratio_override_approver && (
+                          <div style={{ color: "#B5762A" }}>Loss ratio override: approved by {cohort.hcv_loss_ratio_override_approver}</div>
+                        )}
+                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                          <strong>
+                            Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            {" · "}Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo
+                          </strong>
+                          {cohort.min_premium_applied && (
+                            <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div>Base PVPM: R{cohort.base_pvpm?.toFixed(2)}</div>
+                        <div>
+                          Loadings: geo {cohort.loadings?.geo?.toFixed(2)}x · claims {cohort.loadings?.claims?.toFixed(2)}x
+                          · age {cohort.loadings?.age?.toFixed(2)}x · night {cohort.loadings?.night?.toFixed(2)}x
+                          · border {cohort.loadings?.cross?.toFixed(2)}x · cover {cohort.loadings?.restricted?.toFixed(2)}x
+                        </div>
+                        <div>Loaded PVPM: R{cohort.loaded_pvpm?.toFixed(2)}</div>
+                        <div>
+                          IoT adjustment: {(cohort.iot_credit?.total_credit * 100).toFixed(0)}%
+                          {cohort.iot_credit?.capped ? " (capped at -40%)" : ""}
+                        </div>
+                        <div>Final PVPM: R{cohort.final_pvpm?.toFixed(2)}</div>
+                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                          <strong>
+                            R{cohort.final_pvpm?.toFixed(2)} × {cohort.vehicle_count} vehicles = R
+                            {cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            /mo
+                          </strong>
+                          {cohort.min_premium_applied && (
+                            <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>
+                          )}
+                          {cohort.override_applied && (
+                            <span style={{ color: "#B23A2E", marginLeft: "8px" }}>(manual override)</span>
+                          )}
+                        </div>
+                        <div>
+                          Annual: R
+                          {cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -897,6 +1315,12 @@ export default function MultiCohortView({ sharedFleetInfo }) {
             Geography: {sharedFields.geographic_zone.replace(/_/g, " ")} · Claims: {sharedFields.claims_history.replace(/_/g, " ")}
             · Age: {sharedFields.fleet_age.replace(/_/g, " ")} · Night: {sharedFields.night_ops.replace(/_/g, " ")}
             · Border: {sharedFields.cross_border.replace(/_/g, " ")} · Cover: {sharedFields.cover_type.replace(/_/g, " ")}
+          </div>
+          <div style={{ marginTop: "4px" }}>
+            HCV qualifier:{" "}
+            <span style={{ color: (HCV_QUALIFIER[sharedFields.hcv_data_source] || HCV_QUALIFIER.none).color }}>
+              {(HCV_QUALIFIER[sharedFields.hcv_data_source] || HCV_QUALIFIER.none).label}
+            </span>
           </div>
           <div style={{ marginTop: "4px" }}>
             IoT devices: {sharedFields.iot_devices_fitted.length > 0 ? sharedFields.iot_devices_fitted.join(", ") : "none"}

@@ -105,6 +105,202 @@ function scoreFleet(extracted) {
 }
 
 // ---------------------------------------------------------------------------
+// GIT scoring engine — JS port of git_scoring.py. Same constants, same
+// mandatory-security gate. Hardcoded benchmark scenarios only for now;
+// a full input form comes later.
+// ---------------------------------------------------------------------------
+
+const GIT_BASE_ANNUAL_RATE = 0.00711;
+const GIT_BASE_MONTHLY_RATE = GIT_BASE_ANNUAL_RATE / 12;
+const GIT_ALL_RISKS_PERIL_BLEND = 2.0;
+
+const GIT_COMMODITY_FACTORS = {
+  coal_mining_bulk: 0.55,
+  agricultural_grain: 0.98,
+  general_cargo: 1.0,
+  building_materials: 1.1,
+  timber_paper: 1.15,
+  refrigerated_goods: 1.35,
+  machinery_equipment: 1.48,
+  automotive_parts: 1.65,
+  metals_steel_chrome: 2.16,
+  pharmaceuticals: 2.5,
+  alcohol_beverages: 2.83,
+  fuel_petroleum: 2.96,
+  electronics_tech: 3.2,
+  fmcg_retail_general: 5.0,
+  fmcg_branded_high_risk: 8.24,
+};
+
+const GIT_GEOGRAPHIC_ZONE_LOADING = { western_cape: 1.0, medium_risk: 1.15, gauteng_high_risk: 1.3 };
+const GIT_CLAIMS_HISTORY_LOADING = { clean: 1.0, one_claim: 1.15 };
+const GIT_FLEET_AGE_LOADING = { new: 1.0, over_10yr: 1.15 };
+const GIT_NIGHT_OPS_LOADING = { under_30pct: 1.0, over_30pct: 1.2 };
+const GIT_CROSS_BORDER_LOADING = { local: 1.0, sadc: 1.25 };
+
+const GIT_IOT_CREDITS = {
+  gps_realtime_tracking: -0.15,
+  geofencing_alerting: -0.1,
+  driver_behaviour_monitoring: -0.12,
+  fatigue_drowsiness_sensor: -0.08,
+  cargo_seal_door_sensors: -0.1,
+  temperature_humidity_logger: -0.08,
+  load_weight_tilt_sensor: -0.1,
+  panic_button_armed_response: -0.05,
+  dashcam_front_rear: -0.05,
+};
+
+const GIT_NO_IOT_PENALTY = 0.2;
+const GIT_MAX_IOT_CREDIT = -0.4;
+const GIT_PROPOSED_CARGOSNAP_CREDIT = -0.08;
+const GIT_PROPOSED_CVTSCPI_RMP_CREDITS = {
+  none: 0.0,
+  rmp1_top_lock: -0.1,
+  rmp2_cable_lock: -0.15,
+  rmp3_tracktag: -0.2,
+};
+
+function makeGitFleetInput(overrides) {
+  return {
+    fleet_name: "",
+    vehicle_count: 0,
+    load_limit_per_vehicle: 0,
+    commodity_type: "general_cargo",
+    geographic_zone: "western_cape",
+    claims_history: "clean",
+    fleet_age: "new",
+    night_ops: "under_30pct",
+    cross_border: "local",
+    iot_devices_fitted: [],
+    cargosnap_fitted: false,
+    cvtscpi_rmp_tier: "none",
+    is_high_value_cargo: false,
+    is_rmp1_scoped: false,
+    ...overrides,
+  };
+}
+
+function computeGitIotCreditStack(f) {
+  if (f.iot_devices_fitted.length === 0 && !f.cargosnap_fitted && f.cvtscpi_rmp_tier === "none") {
+    return { total_credit: GIT_NO_IOT_PENALTY, detail: "No IoT devices fitted" };
+  }
+  let total = 0.0;
+  const detail = [];
+  for (const device of f.iot_devices_fitted) {
+    if (device in GIT_IOT_CREDITS) {
+      total += GIT_IOT_CREDITS[device];
+      detail.push(`${device}: ${(GIT_IOT_CREDITS[device] * 100).toFixed(0)}%`);
+    }
+  }
+  if (f.cargosnap_fitted) {
+    total += GIT_PROPOSED_CARGOSNAP_CREDIT;
+    detail.push("cargosnap (proposed): -8%");
+  }
+  if (f.cvtscpi_rmp_tier !== "none") {
+    const credit = GIT_PROPOSED_CVTSCPI_RMP_CREDITS[f.cvtscpi_rmp_tier] ?? 0.0;
+    total += credit;
+    detail.push(`cvtscpi_${f.cvtscpi_rmp_tier}: ${(credit * 100).toFixed(0)}%`);
+  }
+  const capped = Math.max(total, GIT_MAX_IOT_CREDIT);
+  return { total_credit: capped, uncapped: total, detail, capped: capped !== total };
+}
+
+function checkGitMandatorySecurityRequirement(f) {
+  const inScope = f.is_high_value_cargo && f.is_rmp1_scoped;
+  if (!inScope) {
+    return {
+      in_scope: false,
+      mandatory_met: true,
+      note: "Fleet outside high-value/RMP-1 scope - no mandatory requirement applies",
+    };
+  }
+  const tiersOk = new Set(["rmp1_top_lock", "rmp2_cable_lock", "rmp3_tracktag"]);
+  const mandatoryMet = tiersOk.has(f.cvtscpi_rmp_tier);
+  return {
+    in_scope: true,
+    mandatory_met: mandatoryMet,
+    note: mandatoryMet ? "RMP 1 minimum satisfied" : "COVER CANNOT BIND - CV+TS+CPI RMP 1 (Top Lock) required",
+  };
+}
+
+function computeGitPvpm(f) {
+  const commodityFactor = GIT_COMMODITY_FACTORS[f.commodity_type];
+  if (commodityFactor == null) {
+    return { error: `Unknown commodity_type: ${f.commodity_type}` };
+  }
+  const basePvpm = GIT_BASE_MONTHLY_RATE * commodityFactor * GIT_ALL_RISKS_PERIL_BLEND * f.load_limit_per_vehicle;
+  const geo = GIT_GEOGRAPHIC_ZONE_LOADING[f.geographic_zone] ?? 1.0;
+  const claims = GIT_CLAIMS_HISTORY_LOADING[f.claims_history] ?? 1.0;
+  const age = GIT_FLEET_AGE_LOADING[f.fleet_age] ?? 1.0;
+  const night = GIT_NIGHT_OPS_LOADING[f.night_ops] ?? 1.0;
+  const cross = GIT_CROSS_BORDER_LOADING[f.cross_border] ?? 1.0;
+  const loadedPvpm = basePvpm * geo * claims * age * night * cross;
+  const iot = computeGitIotCreditStack(f);
+  const finalPvpm = loadedPvpm + loadedPvpm * iot.total_credit;
+  const security = checkGitMandatorySecurityRequirement(f);
+  const totalMonthly = security.mandatory_met ? finalPvpm * f.vehicle_count : null;
+  return {
+    fleet_name: f.fleet_name,
+    base_pvpm: Math.round(basePvpm * 100) / 100,
+    loaded_pvpm: Math.round(loadedPvpm * 100) / 100,
+    iot_credit: iot,
+    final_pvpm: Math.round(finalPvpm * 100) / 100,
+    vehicle_count: f.vehicle_count,
+    total_monthly_premium: totalMonthly != null ? Math.round(totalMonthly * 100) / 100 : null,
+    annual_premium: totalMonthly != null ? Math.round(totalMonthly * 12 * 100) / 100 : null,
+    mandatory_security: security,
+    verdict: security.mandatory_met ? "QUOTABLE" : "CANNOT BIND - mandatory security requirement not met",
+  };
+}
+
+const GIT_BENCHMARK_SCENARIOS = [
+  {
+    label: "Motorworld — FMCG branded, no IoT",
+    input: makeGitFleetInput({
+      fleet_name: "Motorworld",
+      vehicle_count: 106,
+      load_limit_per_vehicle: 1500000,
+      commodity_type: "fmcg_branded_high_risk",
+    }),
+  },
+  {
+    label: "General cargo — GPS + geofencing, no RMP scope",
+    input: makeGitFleetInput({
+      fleet_name: "GeneralCargoCo",
+      vehicle_count: 50,
+      load_limit_per_vehicle: 500000,
+      commodity_type: "general_cargo",
+      iot_devices_fitted: ["gps_realtime_tracking", "geofencing_alerting"],
+    }),
+  },
+  {
+    label: "High-value cargo — RMP1-scoped, NO lock fitted",
+    input: makeGitFleetInput({
+      fleet_name: "HighValueNoLock",
+      vehicle_count: 20,
+      load_limit_per_vehicle: 2000000,
+      commodity_type: "fmcg_branded_high_risk",
+      is_high_value_cargo: true,
+      is_rmp1_scoped: true,
+      cvtscpi_rmp_tier: "none",
+    }),
+  },
+  {
+    label: "High-value cargo — RMP1 fitted + Cargosnap",
+    input: makeGitFleetInput({
+      fleet_name: "HighValueCompliant",
+      vehicle_count: 20,
+      load_limit_per_vehicle: 2000000,
+      commodity_type: "fmcg_branded_high_risk",
+      is_high_value_cargo: true,
+      is_rmp1_scoped: true,
+      cvtscpi_rmp_tier: "rmp1_top_lock",
+      cargosnap_fitted: true,
+    }),
+  },
+];
+
+// ---------------------------------------------------------------------------
 
 const EXTRACTION_PROMPT = `You are a data extraction tool. You will be shown a PDF that is one of two document types used by a South African HCV/GIT insurance underwriter:
 
@@ -155,6 +351,8 @@ const VERDICT_STYLES = {
   REFER: { ink: "#B5762A", label: "REFER" },
   "OFF COVER": { ink: "#B23A2E", label: "OFF COVER" },
   "INSUFFICIENT DATA": { ink: "#5C6570", label: "INSUFFICIENT DATA" },
+  QUOTABLE: { ink: "#3D6B4F", label: "QUOTABLE" },
+  "CANNOT BIND": { ink: "#B23A2E", label: "CANNOT BIND" },
 };
 
 function StampBadge({ verdict }) {
@@ -195,6 +393,7 @@ function fileToBase64(file) {
 
 export default function TelematixRater() {
   const [status, setStatus] = useState("idle"); // idle | reading | extracting | done | error
+  const [mode, setMode] = useState("hcv"); // hcv | git
   const [fileName, setFileName] = useState(null);
   const [extracted, setExtracted] = useState(null);
   const [result, setResult] = useState(null);
@@ -333,6 +532,36 @@ export default function TelematixRater() {
           </p>
         </div>
 
+        {/* Mode tabs */}
+        <div style={{ display: "flex", gap: "8px", marginBottom: "28px" }}>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("hcv")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "hcv" ? "#14213D" : "transparent",
+              color: mode === "hcv" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            HCV Risk Report
+          </button>
+          <button
+            className="tx-btn"
+            onClick={() => setMode("git")}
+            style={{
+              ...tabBtnStyle,
+              background: mode === "git" ? "#14213D" : "transparent",
+              color: mode === "git" ? "#FAF7F0" : "#14213D",
+            }}
+          >
+            GIT Quoting
+          </button>
+        </div>
+
+        {mode === "git" ? (
+          <GitQuotingView />
+        ) : (
+          <>
         {/* Upload zone */}
         {status === "idle" || status === "error" ? (
           <div
@@ -455,7 +684,108 @@ export default function TelematixRater() {
             )}
           </div>
         )}
+          </>
+        )}
       </div>
+    </div>
+  );
+}
+
+const tabBtnStyle = {
+  border: "1.5px solid #14213D",
+  borderRadius: "5px",
+  padding: "8px 16px",
+  fontSize: "0.85rem",
+  fontWeight: 600,
+  cursor: "pointer",
+  fontFamily: "'Inter', sans-serif",
+};
+
+function GitQuotingView() {
+  const [selected, setSelected] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const runScenario = (scenario) => {
+    setSelected(scenario.label);
+    setResult(computeGitPvpm(scenario.input));
+  };
+
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: "0.75rem",
+          color: "#B5762A",
+          marginBottom: "16px",
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+        }}
+      >
+        GIT Quoting — hardcoded benchmark scenarios (form-based input coming later)
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "24px" }}>
+        {GIT_BENCHMARK_SCENARIOS.map((scenario) => (
+          <button
+            key={scenario.label}
+            className="tx-btn"
+            onClick={() => runScenario(scenario)}
+            style={{
+              ...tabBtnStyle,
+              textAlign: "left",
+              background: selected === scenario.label ? "rgba(181,118,42,0.1)" : "transparent",
+              borderColor: selected === scenario.label ? "#B5762A" : "#14213D",
+            }}
+          >
+            {scenario.label}
+          </button>
+        ))}
+      </div>
+
+      {result && !result.error && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "24px" }}>
+            <StampBadge verdict={result.verdict.startsWith("QUOTABLE") ? "QUOTABLE" : "CANNOT BIND"} />
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "1.4rem", fontWeight: 700 }}>
+                {result.total_monthly_premium != null ? "R" + result.total_monthly_premium.toLocaleString() : "—"}
+              </div>
+              <div style={{ fontSize: "0.75rem", color: "#5C6570" }}>Total monthly premium</div>
+            </div>
+          </div>
+
+          <div style={{ background: "#F1ECE0", borderRadius: "6px", padding: "16px 18px", marginBottom: "20px" }}>
+            <div style={{ fontSize: "0.9rem", lineHeight: 1.5 }}>{result.verdict}</div>
+            <div style={{ fontSize: "0.82rem", color: "#5C6570", marginTop: "6px" }}>
+              {result.mandatory_security.note}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px", marginBottom: "22px" }}>
+            <StatBox label="Base PVPM" value={"R" + result.base_pvpm.toLocaleString()} />
+            <StatBox label="Loaded PVPM" value={"R" + result.loaded_pvpm.toLocaleString()} />
+            <StatBox label="Final PVPM" value={"R" + result.final_pvpm.toLocaleString()} />
+            <StatBox label="Vehicle count" value={result.vehicle_count} />
+            <StatBox label="Annual premium" value={result.annual_premium != null ? "R" + result.annual_premium.toLocaleString() : "—"} />
+            <StatBox label="IoT credit" value={(result.iot_credit.total_credit * 100).toFixed(0) + "%"} />
+          </div>
+
+          {Array.isArray(result.iot_credit.detail) && result.iot_credit.detail.length > 0 && (
+            <div>
+              <SectionLabel>Credit breakdown</SectionLabel>
+              <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "0.82rem", color: "#5C6570", lineHeight: 1.6 }}>
+                {result.iot_credit.detail.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {typeof result.iot_credit.detail === "string" && (
+            <div style={{ fontSize: "0.82rem", color: "#5C6570" }}>{result.iot_credit.detail}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
