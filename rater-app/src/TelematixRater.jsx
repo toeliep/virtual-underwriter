@@ -256,6 +256,9 @@ function makeGitFleetInput(overrides) {
     commodity_type: "general_cargo",
     geographic_zone: "western_cape",
     claims_history: "clean",
+    fleet_age: "new",
+    night_ops: "under_30pct",
+    cross_border: "local",
     loss_ratio_pct: null, // v2: actual loss ratio %, if known. null = not yet available.
     fleet_age: "new",
     night_ops: "under_30pct",
@@ -1459,6 +1462,9 @@ function makeFleetInfoDefaults() {
     claims_history: "clean",
     loss_ratio_pct: null,
     cover_type: "all_risks",
+    fleet_age: "new",
+    night_ops: "under_30pct",
+    cross_border: "local",
     iot_devices_fitted: [],
     cargosnap_fitted: false,
     cvtscpi_rmp_tier: "none",
@@ -1468,7 +1474,7 @@ function makeFleetInfoDefaults() {
 }
 
 function FleetInformationView({ sharedFleetInfo, onSave }) {
-  const [form, setForm] = useState(sharedFleetInfo || makeFleetInfoDefaults());
+  const [form, setForm] = useState({ ...makeFleetInfoDefaults(), ...(sharedFleetInfo || {}) });
   const [saved, setSaved] = useState(false);
   const [extractStatus, setExtractStatus] = useState("idle"); // idle | reading | extracting | done | error
   const [extractError, setExtractError] = useState(null);
@@ -1846,7 +1852,16 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           </FormField>
           <FormField label="Average vehicle year model">
             <input
-              onFocus={(e) => setTimeout(() => e.target.select(), 0)} type="number" value={form.year_model} onChange={(e) => updateField("year_model", Number(e.target.value))} onWheel={(e) => e.target.blur()} style={formInputStyle} />
+              type="number" min="1980" max="2030" step="1"
+              onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+              value={form.year_model || ""}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                if (!isNaN(v) && v >= 1980 && v <= 2030) updateField("year_model", v);
+                else if (e.target.value === "") updateField("year_model", new Date().getFullYear());
+              }}
+              onWheel={(e) => e.target.blur()}
+              style={formInputStyle} />
           </FormField>
           <FormField label="Avg km / vehicle / month">
             <input
@@ -1998,6 +2013,33 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
               <option value="all_risks">All Risks</option>
               <option value="fire_collision_overturning_theft_hijack">Restricted - Fire/Collision/Overturning/Theft-Hijack (80%)</option>
               <option value="fire_collision_overturning_only">Restricted - Fire/Collision/Overturning only (75%)</option>
+            </select>
+          </FormField>
+          <FormField label="Fleet age">
+            <select
+              value={form.fleet_age || "new"}
+              onChange={(e) => { const v = e.target.value; setForm(f => ({ ...f, fleet_age: v })); setSaved(false); }}
+              style={formInputStyle}>
+              <option value="new">New (under 10 years)</option>
+              <option value="over_10yr">Over 10 years</option>
+            </select>
+          </FormField>
+          <FormField label="Night operations">
+            <select
+              value={form.night_ops || "under_30pct"}
+              onChange={(e) => { const v = e.target.value; setForm(f => ({ ...f, night_ops: v })); setSaved(false); }}
+              style={formInputStyle}>
+              <option value="under_30pct">Under 30% distance after 22:00</option>
+              <option value="over_30pct">Over 30% distance after 22:00</option>
+            </select>
+          </FormField>
+          <FormField label="Cross-border">
+            <select
+              value={form.cross_border || "local"}
+              onChange={(e) => { const v = e.target.value; setForm(f => ({ ...f, cross_border: v })); setSaved(false); }}
+              style={formInputStyle}>
+              <option value="local">Local (RSA only)</option>
+              <option value="sadc">SADC cross-border</option>
             </select>
           </FormField>
         </div>

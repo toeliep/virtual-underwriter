@@ -457,7 +457,8 @@ Extract the following structure:
       "premium": number or null,
       "claims": number or null,
       "loss_ratio_pct": number or null,
-      "claim_count": number or null
+      "claim_count": number or null,
+      "is_complete": true or false
     }
   ],
   "line_items": [
@@ -472,12 +473,13 @@ Extract the following structure:
 }
 
 Rules:
-- Aggregate monthly data into calendar years where monthly data is provided.
-- loss_ratio_pct = (claims / premium) * 100. Compute it if not stated.
+- Aggregate monthly data into calendar years.
+- Add is_complete field per year: false if the year contains projected/future months with zero claims but non-zero premium (these distort the loss ratio), true otherwise.
+- ALWAYS compute loss_ratio_pct per year: (claims / premium) * 100. This is mandatory — never leave it null when premium and claims are both available.
 - Include ALL claim line items you can identify in line_items.
 - If no line-item breakdown exists, set line_items to [].
-- extraction_notes: describe what you found, any outlier months, any data quality issues.
-- Do NOT compute sums yourself — provide raw per-year figures only.`;
+- extraction_notes: describe what you found, any outlier months, projected months, and data quality issues.
+- IMPORTANT: you MUST compute per-year loss_ratio_pct values.`;
 
 export default function MultiCohortView({ sharedFleetInfo }) {
   const shared = sharedFleetInfo || {};
@@ -578,19 +580,23 @@ export default function MultiCohortView({ sharedFleetInfo }) {
   }, []);
 
   const applyClaimsToCohorts = useCallback((splitPct) => {
-    // splitPct: { [cohortId]: percentage (0-100) } — must sum to 100
     if (!claimsStepA || !claimsStepA.years) return;
-    const years = claimsStepA.years;
-    const totalClaims = years.reduce((s, y) => s + (y.claims || 0), 0);
-    const totalPremium = years.reduce((s, y) => s + (y.premium || 0), 0);
-    const overallLR = totalPremium > 0 ? (totalClaims / totalPremium) * 100 : null;
+    // Only use complete years (exclude projected/future months)
+    const years = claimsStepA.years.filter(y => y.is_complete !== false);
+    const allYears = claimsStepA.years; // fallback if no complete years flagged
+    const useYears = years.length > 0 ? years : allYears;
+
+    const totalClaims  = useYears.reduce((s, y) => s + (y.claims  || 0), 0);
+    const totalPremium = useYears.reduce((s, y) => s + (y.premium || 0), 0);
+    const overallLR    = totalPremium > 0 ? (totalClaims / totalPremium) * 100 : null;
 
     setCohorts(prev => prev.map(c => {
-      const pct = (splitPct[c.id] ?? 0) / 100;
+      const pct           = (splitPct[c.id] ?? 0) / 100;
       const cohortClaims  = totalClaims  * pct;
       const cohortPremium = totalPremium * pct;
       const cohortLR      = cohortPremium > 0 ? (cohortClaims / cohortPremium) * 100 : overallLR;
-      return { ...c, hcv_loss_ratio_pct: cohortLR != null ? Math.round(cohortLR * 10) / 10 : null };
+      const lr            = cohortLR != null ? Math.round(cohortLR * 10) / 10 : null;
+      return { ...c, hcv_loss_ratio_pct: lr, _claims_applied: Date.now() };
     }));
     setClaimsApplied(true);
   }, [claimsStepA]);
@@ -815,7 +821,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
             className="tx-btn"
             onClick={() => {
               import("./generateQuotePDF.js").then((mod) => {
-                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, shared);
+                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, { ...sharedFields, fleet_name: shared.fleet_name, iot_devices: sharedFields.iot_devices_fitted });
               });
             }}
             style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
