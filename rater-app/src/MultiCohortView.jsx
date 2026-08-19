@@ -1,4 +1,5 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useRef } from "react";
+import * as XLSX from "xlsx";
 import {
   checkTrackingGate,
   determineGitCoverTier,
@@ -389,9 +390,9 @@ function makeCohort(index, shared) {
     agri_machine_type: "tractor",
     agri_data_source: "oemOnly",
     // HCV-specific fields
-    hcv_sum_insured_per_vehicle: 0,
-    hcv_manufacturer: "mercedes_benz",
-    hcv_year_model: new Date().getFullYear(),
+    hcv_sum_insured_per_vehicle: shared?.avg_sum_insured_per_vehicle || 0,
+    hcv_manufacturer: shared?.manufacturer || "mercedes_benz",
+    hcv_year_model: shared?.year_model || new Date().getFullYear(),
     hcv_data_source: "oem_only",
     hcv_loss_ratio_pct: null,
     hcv_loss_ratio_override_approver: "",
@@ -441,14 +442,168 @@ function computeUnderwritingStatus(cohort) {
 // Component
 // ============================================================================
 
+const CLAIMS_EXTRACTION_PROMPT = `You are extracting claims history data from a transport/fleet insurance document.
+Return ONLY a valid JSON object — no preamble, no explanation, no markdown fences.
+
+Extract the following structure:
+{
+  "fleet_name": string or null,
+  "period_start": "YYYY-MM" or null,
+  "period_end": "YYYY-MM" or null,
+  "stated_loss_ratio_pct": number or null,
+  "years": [
+    {
+      "year": number,
+      "premium": number or null,
+      "claims": number or null,
+      "loss_ratio_pct": number or null,
+      "claim_count": number or null
+    }
+  ],
+  "line_items": [
+    {
+      "description": string,
+      "amount": number,
+      "year": number or null,
+      "type": "motor" | "git" | "other" | null
+    }
+  ],
+  "extraction_notes": string
+}
+
+Rules:
+- Aggregate monthly data into calendar years where monthly data is provided.
+- loss_ratio_pct = (claims / premium) * 100. Compute it if not stated.
+- Include ALL claim line items you can identify in line_items.
+- If no line-item breakdown exists, set line_items to [].
+- extraction_notes: describe what you found, any outlier months, any data quality issues.
+- Do NOT compute sums yourself — provide raw per-year figures only.`;
+
 export default function MultiCohortView({ sharedFleetInfo }) {
   const shared = sharedFleetInfo || {};
   const [cohorts, setCohorts] = useState(() => [makeCohort(0, shared)]);
+
+  // Reset to single fresh cohort ONLY when fleet_name changes (i.e. a new fleet was saved)
+  const prevFleetNameRef = useRef(shared?.fleet_name);
+  React.useEffect(() => {
+    const newName = shared?.fleet_name;
+    if (newName && newName !== prevFleetNameRef.current) {
+      prevFleetNameRef.current = newName;
+      setCohorts([makeCohort(0, shared)]);
+    }
+  }, [shared?.fleet_name]);
   const [expandedCohort, setExpandedCohort] = useState(0);
   const [overrideApproverName, setOverrideApproverName] = useState("");
 
+  // Claims History intake state
+  const [claimsStatus, setClaimsStatus]   = useState("idle"); // idle | reading | extracting | done | error
+  const [claimsError, setClaimsError]     = useState(null);
+  const [claimsStepA, setClaimsStepA]     = useState(null);   // Step A extraction result
+  const [claimsStep, setClaimsStep]       = useState("A");    // "A" | "B_auto" | "B_manual"
+  const [claimsApplied, setClaimsApplied] = useState(false);
+  const [claimsDragOver, setClaimsDragOver] = useState(false);
+  // Manual split grid: { [cohortId]: { [year]: { motor: %, git: %, other: % } } }
+  const [manualSplit, setManualSplit]      = useState({});
+  const claimsInputRef = useRef(null);
+
+  // ── Claims History processing ───────────────────────────────────────────────
+  const processClaimsFile = useCallback(async (file) => {
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    const isPdf   = file.type === "application/pdf" || name.endsWith(".pdf");
+    const isExcel = name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".csv");
+    if (!isPdf && !isExcel) {
+      setClaimsError("Please provide a PDF or Excel (.xlsx/.xls/.csv) file.");
+      setClaimsStatus("error");
+      return;
+    }
+    setClaimsStatus("reading");
+    setClaimsError(null);
+    setClaimsStepA(null);
+    setClaimsStep("A");
+    setClaimsApplied(false);
+
+    try {
+      let requestBody;
+      if (isExcel) {
+        const arrayBuffer = await file.arrayBuffer();
+        const workbook = XLSX.read(arrayBuffer, { type: "array" });
+        const csvSheets = workbook.SheetNames.map((sn) => {
+          const sheet = workbook.Sheets[sn];
+          return `Sheet: ${sn}\n${XLSX.utils.sheet_to_csv(sheet, { blankrows: false })}`;
+        }).join("\n\n");
+        setClaimsStatus("extracting");
+        requestBody = JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4000,
+          system: "You are a data extraction assistant. Respond with valid JSON only. No preamble, no markdown fences.",
+          messages: [{ role: "user", content: [{ type: "text", text: `${CLAIMS_EXTRACTION_PROMPT}\n\nDocument content (Excel converted to CSV):\n${csvSheets}` }] }],
+        });
+      } else {
+        const reader = new FileReader();
+        const b64 = await new Promise((res, rej) => {
+          reader.onload = () => res(reader.result.split(",")[1]);
+          reader.onerror = rej;
+          reader.readAsDataURL(file);
+        });
+        setClaimsStatus("extracting");
+        requestBody = JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4000,
+          system: "You are a data extraction assistant. Respond with valid JSON only. No preamble, no markdown fences.",
+          messages: [{ role: "user", content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+            { type: "text", text: CLAIMS_EXTRACTION_PROMPT }
+          ]}],
+        });
+      }
+
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+      });
+
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+      const data = await response.json();
+      const rawText = (data.content || []).map(b => b.text || "").join("").trim()
+        .replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+      const extracted = JSON.parse(rawText);
+      setClaimsStepA(extracted);
+      setClaimsStatus("done");
+    } catch (err) {
+      setClaimsStatus("error");
+      setClaimsError("Extraction failed: " + (err.message || String(err)));
+    }
+  }, []);
+
+  const applyClaimsToCohorts = useCallback((splitPct) => {
+    // splitPct: { [cohortId]: percentage (0-100) } — must sum to 100
+    if (!claimsStepA || !claimsStepA.years) return;
+    const years = claimsStepA.years;
+    const totalClaims = years.reduce((s, y) => s + (y.claims || 0), 0);
+    const totalPremium = years.reduce((s, y) => s + (y.premium || 0), 0);
+    const overallLR = totalPremium > 0 ? (totalClaims / totalPremium) * 100 : null;
+
+    setCohorts(prev => prev.map(c => {
+      const pct = (splitPct[c.id] ?? 0) / 100;
+      const cohortClaims  = totalClaims  * pct;
+      const cohortPremium = totalPremium * pct;
+      const cohortLR      = cohortPremium > 0 ? (cohortClaims / cohortPremium) * 100 : overallLR;
+      return { ...c, hcv_loss_ratio_pct: cohortLR != null ? Math.round(cohortLR * 10) / 10 : null };
+    }));
+    setClaimsApplied(true);
+  }, [claimsStepA]);
+
+  const newCohortRef = useRef(null);
+
   const addCohort = useCallback(() => {
     setCohorts((prev) => [...prev, makeCohort(prev.length, shared)]);
+    setTimeout(() => {
+      if (newCohortRef.current) {
+        newCohortRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }, 100);
   }, [shared]);
 
   const removeCohort = useCallback((id) => {
@@ -698,10 +853,12 @@ export default function MultiCohortView({ sharedFleetInfo }) {
         const isPlantAgri = cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment";
         const isHcv = HCV_ASSET_CLASSES.has(cohort.asset_class);
         const needsOverride = isReferred && !isPlantAgri && !isHcv && cohort.load_limit_per_vehicle < GIT_LOAD_LIMIT_MIN_RAND;
+        const isLastCohort = idx === pricedCohorts.length - 1;
 
         return (
           <div
             key={cohort.id}
+            ref={isLastCohort ? newCohortRef : null}
             style={{
               background: "#FFFFFF",
               border: `1.5px solid ${isReferred ? "#B23A2E" : isExpanded ? "#B5762A" : "#E4DCC9"}`,
@@ -740,6 +897,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                   {" · "}
                   {isPlantAgri
                     ? `R${(cohort.machine_value_per_unit || 0).toLocaleString()} /machine`
+                    : isHcv
+                    ? `R${(cohort.hcv_sum_insured_per_vehicle || 0).toLocaleString()} /vehicle`
                     : `R${(cohort.load_limit_per_vehicle || 0).toLocaleString()} load limit`}
                 </div>
               </div>
@@ -761,7 +920,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                     {cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment"
                       ? `${cohort.rating_factor?.toFixed(2)}x · ${cohort.profile}`
                       : HCV_ASSET_CLASSES.has(cohort.asset_class)
-                      ? `${cohort.hcv_qualifier?.factor?.toFixed(2)}× qualifier · R${cohort.final_pvpm?.toFixed(2)}/veh`
+                      ? `${cohort.hcv_qualifier?.factor?.toFixed(2)}× qualifier · ${cohort.hcv_age_band?.replace(/_/g," ") || ""} age band`
                       : `${cohort.multiplier?.toFixed(2)}x · R${cohort.final_pvpm?.toFixed(2)}/veh`}
                   </div>
                 )}
@@ -847,6 +1006,11 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                         onWheel={(e) => e.target.blur()}
                         style={inputStyle}
                       />
+                      {cohort.hcv_sum_insured_per_vehicle > 10000000 && (
+                        <div style={{ fontSize: "0.74rem", color: "#B5762A", marginTop: "3px" }}>
+                          ⚠ Sum insured per vehicle exceeds R10m — please verify this figure.
+                        </div>
+                      )}
                     </div>
                   )}
                   {(cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment") && (
@@ -901,7 +1065,10 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                         style={inputStyle} />
                     </div>
                     <div>
-                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Loss ratio % (leave blank if unknown)</div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>
+                        Loss ratio % (leave blank if unknown)
+                        {cohort.hcv_loss_ratio_pct != null && <span style={{ color: "#B5762A", marginLeft: "6px" }}>(applied from claims history)</span>}
+                      </div>
                       <input type="number" min="0" max="999" placeholder="e.g. 74.2"
                         value={cohort.hcv_loss_ratio_pct ?? ""}
                         onFocus={(e) => setTimeout(() => e.target.select(), 0)}
@@ -1297,6 +1464,96 @@ export default function MultiCohortView({ sharedFleetInfo }) {
         );
       })}
 
+      {/* Claims History Upload */}
+      <div style={{ marginTop: "24px", padding: "16px 18px", background: "#F5F7FA", borderRadius: "8px", border: "1px solid #E0E6EE" }}>
+        <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#14213D", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "10px" }}>Claims History Upload</div>
+        <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "12px" }}>
+          Upload a 3-year claims history (PDF or Excel). Loss ratios are extracted per year, allocated to cohorts, and the 65% referral gate applies automatically.
+        </div>
+        {(claimsStatus === "idle" || claimsStatus === "error") && (
+          <div
+            onDragOver={e => { e.preventDefault(); setClaimsDragOver(true); }}
+            onDragLeave={() => setClaimsDragOver(false)}
+            onDrop={e => { e.preventDefault(); setClaimsDragOver(false); processClaimsFile(e.dataTransfer.files[0]); }}
+            onClick={() => claimsInputRef.current?.click()}
+            style={{ border: `2px dashed ${claimsDragOver ? "#14213D" : "#C8D0DC"}`, borderRadius: "6px", padding: "20px", textAlign: "center", cursor: "pointer", background: claimsDragOver ? "#E8EDF5" : "#fff", marginBottom: "8px" }}
+          >
+            <div style={{ fontSize: "0.88rem", color: "#5C6570" }}>Drop claims history PDF or Excel here, or click to upload</div>
+            <input ref={claimsInputRef} type="file" accept=".pdf,.xlsx,.xls,.csv" style={{ display: "none" }} onChange={e => processClaimsFile(e.target.files[0])} />
+          </div>
+        )}
+        {claimsError && <div style={{ color: "#C0392B", fontSize: "0.82rem", marginBottom: "8px" }}>{claimsError}</div>}
+        {(claimsStatus === "reading" || claimsStatus === "extracting") && (
+          <div style={{ color: "#14213D", fontSize: "0.85rem", padding: "12px" }}>
+            {claimsStatus === "reading" ? "Reading document..." : "Extracting claims data — this takes a few seconds..."}
+          </div>
+        )}
+        {claimsStatus === "done" && claimsStepA && !claimsApplied && (
+          <div style={{ marginTop: "8px" }}>
+            <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#14213D", marginBottom: "8px" }}>Step A — Review extracted claims data</div>
+            {claimsStepA.extraction_notes && (
+              <div style={{ fontSize: "0.76rem", color: "#B5762A", marginBottom: "10px", padding: "8px", background: "#FFF8EE", borderRadius: "4px" }}>{claimsStepA.extraction_notes}</div>
+            )}
+            {claimsStepA.years && claimsStepA.years.length > 0 && (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.80rem", marginBottom: "12px" }}>
+                <thead>
+                  <tr style={{ background: "#14213D", color: "#FAF7F0" }}>
+                    {["Year","Premium (R)","Claims (R)","Loss Ratio %","Claims #"].map(h => <th key={h} style={{ padding: "6px 10px", textAlign: h === "Year" ? "left" : "right" }}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {claimsStepA.years.map((y, i) => (
+                    <tr key={y.year} style={{ background: i % 2 === 0 ? "#fff" : "#F5F7FA" }}>
+                      <td style={{ padding: "5px 10px" }}>{y.year}</td>
+                      <td style={{ padding: "5px 10px", textAlign: "right" }}>{y.premium != null ? `R${Number(y.premium).toLocaleString("en-ZA")}` : "—"}</td>
+                      <td style={{ padding: "5px 10px", textAlign: "right" }}>{y.claims != null ? `R${Number(y.claims).toLocaleString("en-ZA")}` : "—"}</td>
+                      <td style={{ padding: "5px 10px", textAlign: "right", color: (y.loss_ratio_pct || 0) > 65 ? "#C0392B" : "#1A6B3C", fontWeight: 600 }}>
+                        {y.loss_ratio_pct != null ? `${Number(y.loss_ratio_pct).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{ padding: "5px 10px", textAlign: "right" }}>{y.claim_count ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#14213D", marginBottom: "6px" }}>Step B — Allocate claims to cohorts (% split, must total 100%)</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px", gap: "6px", alignItems: "center", marginBottom: "10px" }}>
+              {cohorts.map(c => (
+                <React.Fragment key={c.id}>
+                  <div style={{ fontSize: "0.82rem", color: "#14213D" }}>{c.label} — {c.asset_class?.replace(/_/g," ")}</div>
+                  <input type="number" min={0} max={100} value={manualSplit[c.id] ?? ""} onChange={e => setManualSplit(prev => ({ ...prev, [c.id]: Number(e.target.value) }))} placeholder="0"
+                    style={{ padding: "5px 8px", border: "1px solid #C8D0DC", borderRadius: "4px", textAlign: "right", fontSize: "0.85rem" }} />
+                </React.Fragment>
+              ))}
+            </div>
+            {(() => {
+              const total = Object.values(manualSplit).reduce((s, v) => s + (v || 0), 0);
+              return (
+                <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                  <div style={{ fontSize: "0.78rem", color: Math.abs(total - 100) < 0.1 ? "#1A6B3C" : "#C0392B" }}>Total: {total}% {Math.abs(total - 100) < 0.1 ? "✓" : "(must equal 100%)"}</div>
+                  <button disabled={Math.abs(total - 100) > 0.1} onClick={() => applyClaimsToCohorts(manualSplit)}
+                    style={{ background: Math.abs(total - 100) < 0.1 ? "#14213D" : "#C8D0DC", color: "#fff", border: "none", borderRadius: "5px", padding: "8px 20px", fontSize: "0.85rem", fontWeight: 600, cursor: Math.abs(total - 100) < 0.1 ? "pointer" : "not-allowed" }}>
+                    Confirm & Apply to Cohorts
+                  </button>
+                  <button onClick={() => { setClaimsStatus("idle"); setClaimsStepA(null); setManualSplit({}); }}
+                    style={{ background: "transparent", border: "1px solid #C8D0DC", borderRadius: "5px", padding: "8px 14px", fontSize: "0.82rem", cursor: "pointer", color: "#5C6570" }}>Re-upload</button>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+        {claimsApplied && (
+          <div style={{ padding: "10px 14px", background: "#E8F5EE", borderRadius: "6px", border: "1px solid #1A6B3C", marginTop: "8px" }}>
+            <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#1A6B3C", marginBottom: "4px" }}>✓ Claims history applied to cohorts</div>
+            <div style={{ fontSize: "0.78rem", color: "#5C6570" }}>Loss ratios applied. Cohorts exceeding 65% will show a REFER gate.</div>
+            <button onClick={() => { setClaimsStatus("idle"); setClaimsStepA(null); setManualSplit({}); setClaimsApplied(false); }}
+              style={{ marginTop: "8px", background: "transparent", border: "1px solid #C8D0DC", borderRadius: "4px", padding: "5px 12px", fontSize: "0.78rem", cursor: "pointer", color: "#5C6570" }}>
+              Upload new claims history
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* Shared loadings summary */}
       <div style={{ marginTop: "24px" }}>
         <div style={sectionLabelStyle}>Shared loadings (from Fleet Information)</div>
@@ -1318,8 +1575,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
           </div>
           <div style={{ marginTop: "4px" }}>
             HCV qualifier:{" "}
-            <span style={{ color: (HCV_QUALIFIER[sharedFields.hcv_data_source] || HCV_QUALIFIER.none).color }}>
-              {(HCV_QUALIFIER[sharedFields.hcv_data_source] || HCV_QUALIFIER.none).label}
+            <span style={{ color: "#5C6570", fontStyle: "italic" }}>
+              Set per cohort in HCV Underwriting panel
             </span>
           </div>
           <div style={{ marginTop: "4px" }}>

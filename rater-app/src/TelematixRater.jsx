@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef } from "react";
+import * as XLSX from "xlsx";
 import MultiCohortView from "./MultiCohortView.jsx";
 import { generateHcvQuotePDF, generateGitQuotePDF, generateMultiCohortQuotePDF } from "./generateQuotePDF.js";
 
@@ -1472,6 +1473,7 @@ function FleetInformationView({ sharedFleetInfo, onSave }) {
   const [extractStatus, setExtractStatus] = useState("idle"); // idle | reading | extracting | done | error
   const [extractError, setExtractError] = useState(null);
   const [extractNotes, setExtractNotes] = useState(null);
+  const [extractKey, setExtractKey] = useState(0); // increments on each extraction to force form re-render
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
@@ -1537,23 +1539,85 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
 }`;
 
   const processDocument = useCallback(async (file) => {
-    if (!file || !(file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    const isPdf = file.type === "application/pdf" || name.endsWith(".pdf");
+    const isExcel = name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".csv");
+
+    if (!isPdf && !isExcel) {
       setExtractStatus("error");
-      setExtractError("Please provide a PDF file.");
+      setExtractError("Please provide a PDF or Excel (.xlsx/.xls/.csv) file.");
       return;
     }
     setExtractStatus("reading");
     setExtractError(null);
     setExtractNotes(null);
 
-    try {
-      const b64 = await fileToBase64(file);
-      setExtractStatus("extracting");
+    // Pre-computed JS figures (Excel only — remain 0 for PDF path)
+    let jsVehicleCount = 0;
+    let jsTotalSumInsured = 0;
 
-      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+    try {
+      let requestBody;
+
+      if (isExcel) {
+        // Parse Excel/CSV client-side using SheetJS
+        // XLSX already statically imported at top of file
+        const arrayBuffer = await file.arrayBuffer();
+        const workbook = XLSX.read(arrayBuffer, { type: "array" });
+
+        // Pre-compute vehicle count and sum insured in JavaScript (do NOT trust AI arithmetic)
+        let jsComputedNote = "";
+        workbook.SheetNames.forEach((sheetName) => {
+          const sheet = workbook.Sheets[sheetName];
+          const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+          if (rows.length < 2) return;
+          // Find header row — look for a row containing "SUM INSURED" or "INSURED" or "VALUE"
+          const headerIdx = rows.findIndex(r => r.some(c => String(c).toUpperCase().includes("INSURED") || String(c).toUpperCase().includes("VALUE")));
+          if (headerIdx < 0) return;
+          const headers = rows[headerIdx].map(c => String(c).toUpperCase());
+          const siCol = headers.findIndex(h => h.includes("SUM INSURED") || h.includes("INSURED VALUE") || (h.includes("INSURED") && !h.includes("RETAIL")));
+          if (siCol < 0) return;
+          for (let i = headerIdx + 1; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row || row.every(c => c === "" || c == null)) continue;
+            const val = parseFloat(String(row[siCol]).replace(/[^0-9.]/g, ""));
+            if (!isNaN(val) && val > 0) {
+              jsVehicleCount++;
+              jsTotalSumInsured += val;
+            }
+          }
+          jsComputedNote = `JS pre-computed: ${jsVehicleCount} vehicles, total sum insured R${jsTotalSumInsured.toLocaleString("en-ZA")}, avg R${Math.round(jsTotalSumInsured / jsVehicleCount).toLocaleString("en-ZA")} — use these figures, do NOT recompute.`;
+        });
+
+        const csvSheets = workbook.SheetNames.map((sheetName) => {
+          const sheet = workbook.Sheets[sheetName];
+          const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          return `Sheet: ${sheetName}\n${csv}`;
+        }).join("\n\n");
+
+        setExtractStatus("extracting");
+        const preComputedNote = jsVehicleCount > 0
+          ? `IMPORTANT: JavaScript has already counted and summed the fleet schedule. Use these pre-computed figures exactly — do NOT recount or resum:\n- vehicle_count: ${jsVehicleCount}\n- total_sum_insured: ${jsTotalSumInsured}\n- avg_sum_insured_per_vehicle: ${Math.round(jsTotalSumInsured / jsVehicleCount)}\n`
+          : "";
+
+        requestBody = JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4000,
+          system: "You are a data extraction assistant. You MUST respond with valid JSON only. No preamble, no explanation, no markdown fences. Your entire response must be a single valid JSON object.",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: `Extract fleet data from the following Excel content (converted to CSV). Return ONLY a valid JSON object — no text before or after it, no markdown fences.\n\n${preComputedNote}\nExcel content:\n${csvSheets}\n\n${FLEET_INFO_EXTRACTION_PROMPT}` },
+              ],
+            },
+          ],
+        });
+      } else {
+        const b64 = await fileToBase64(file);
+        setExtractStatus("extracting");
+        requestBody = JSON.stringify({
           model: "claude-sonnet-4-6",
           max_tokens: 4000,
           messages: [
@@ -1565,7 +1629,13 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
               ],
             },
           ],
-        }),
+        });
+      }
+
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
       });
 
       const data = await response.json();
@@ -1579,6 +1649,14 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
       }
 
       const extracted = JSON.parse(rawText);
+
+      // Inject JS pre-computed figures if AI returned null (Excel path only — jsVehicleCount=0 for PDF)
+      if (jsVehicleCount > 0) {
+        if (extracted.vehicle_count == null || extracted.vehicle_count === 0) extracted.vehicle_count = jsVehicleCount;
+        if (extracted.avg_sum_insured_per_vehicle == null || extracted.avg_sum_insured_per_vehicle === 0) {
+          extracted.avg_sum_insured_per_vehicle = Math.round(jsTotalSumInsured / jsVehicleCount);
+        }
+      }
 
       // Map extracted values into form fields (only overwrite non-null extractions)
       setForm((prev) => {
@@ -1611,6 +1689,7 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
       setExtractNotes(extracted.extraction_notes || null);
       setExtractStatus("done");
       setSaved(false);
+      setExtractKey((k) => k + 1); // force form fields to re-render with new values
     } catch (err) {
       setExtractStatus("error");
       setExtractError("Extraction failed: " + (err.message || String(err)));
@@ -1667,12 +1746,12 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf"
+            accept=".pdf,.xlsx,.xls,.csv"
             onChange={handleFileSelect}
             style={{ display: "none" }}
           />
           <div style={{ fontSize: "0.88rem", color: "#14213D", fontWeight: 600 }}>
-            {extractStatus === "idle" && "Drop a PDF here or click to upload — policy schedule, fleet listing, quote, or broker submission"}
+            {extractStatus === "idle" && "Drop a PDF or Excel file here, or click to upload — policy schedule, fleet listing, quote, or broker submission"}
             {extractStatus === "reading" && "Reading document..."}
             {extractStatus === "extracting" && "Extracting fleet details — this takes a few seconds..."}
             {extractStatus === "done" && "Extraction complete — fields populated below. Review and edit before saving."}
@@ -1689,11 +1768,12 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           {extractNotes && (
             <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "6px" }}>Notes: {extractNotes}</div>
           )}
+
         </div>
       </div>
 
-      {/* Shared section */}
-      <div style={{ marginBottom: "20px" }}>
+      {/* Shared section — key forces re-render after extraction populates form state */}
+      <div key={`form-${extractKey}`} style={{ marginBottom: "20px" }}>
         <SectionLabel>Shared fleet details</SectionLabel>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginTop: "12px" }}>
           <FormField label="Fleet name">
@@ -2531,7 +2611,7 @@ export default function TelematixRater() {
           </h1>
           {/* pipeline-v3 */}
           <p style={{ color: "#5C6570", fontSize: "0.95rem", marginTop: "8px", marginBottom: 0 }}>
-            One pipeline: Intake → Risk Scoring → Pricing, branching by asset class. [v3] Capture fleet details once in Fleet Information to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
+            One pipeline: Intake → Risk Scoring → Pricing, branching by asset class. Capture fleet details once in Fleet Information to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
           </p>
         </div>
 

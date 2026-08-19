@@ -16,6 +16,13 @@ const LIGHT_BG = [247, 245, 240];
 const GREY = [92, 101, 112];
 const BLACK = [51, 51, 51];
 
+const HCV_ASSET_CLASSES = new Set([
+  "hcv_general_freight","fuel_hazmat_tanker","minerals_bulk_long_haul",
+  "fmcg_distribution","bulk_liquids_non_hazmat","refrigerated_cold_chain",
+  "abnormal_loads_oversized",
+]);
+const PLANT_AGRI_CLASSES = new Set(["yellow_metal_plant","agricultural_equipment"]);
+
 function fmt(n) {
   if (n == null) return "—";
   return "R" + Number(n).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -24,29 +31,20 @@ function fmt(n) {
 function addHeader(doc, title, subtitle) {
   doc.setFillColor(...NAVY);
   doc.rect(0, 0, 210, 32, "F");
-
   doc.setFillColor(...GOLD);
   doc.rect(0, 32, 210, 2, "F");
-
   doc.setFont("helvetica", "bold");
   doc.setFontSize(18);
   doc.setTextColor(...WHITE);
   doc.text("ORCA TelematiX", 14, 14);
-
   doc.setFontSize(11);
   doc.setFont("helvetica", "normal");
   doc.text(title, 14, 22);
-
-  if (subtitle) {
-    doc.setFontSize(9);
-    doc.text(subtitle, 14, 28);
-  }
-
+  if (subtitle) { doc.setFontSize(9); doc.text(subtitle, 14, 28); }
   doc.setFontSize(9);
   doc.setTextColor(...WHITE);
   const dateStr = new Date().toLocaleDateString("en-ZA", { day: "2-digit", month: "long", year: "numeric" });
   doc.text(dateStr, 196, 14, { align: "right" });
-
   return 42;
 }
 
@@ -84,16 +82,9 @@ function addKeyValueTable(doc, y, rows) {
     },
     body: rows,
     theme: "plain",
-    styles: {
-      fontSize: 9,
-      cellPadding: 3,
-      lineColor: [204, 204, 204],
-      lineWidth: 0.25,
-    },
+    styles: { fontSize: 9, cellPadding: 3, lineColor: [204, 204, 204], lineWidth: 0.25 },
     didParseCell: (data) => {
-      if (data.column.index === 0) {
-        data.cell.styles.fillColor = LIGHT_BG;
-      }
+      if (data.column.index === 0) data.cell.styles.fillColor = LIGHT_BG;
     },
   });
   return doc.lastAutoTable.finalY + 6;
@@ -103,7 +94,6 @@ function addKeyValueTable(doc, y, rows) {
 export function generateHcvQuotePDF(form, result) {
   const doc = new jsPDF();
   let y = addHeader(doc, "HCV Fleet Risk Rating — Indicative Quote", form.fleet_name || "Unnamed Fleet");
-
   y = addSectionTitle(doc, y, "Fleet Details");
   y = addKeyValueTable(doc, y, [
     ["Fleet Name", form.fleet_name || "—"],
@@ -115,7 +105,6 @@ export function generateHcvQuotePDF(form, result) {
     ["Vehicle Year Model", String(form.year_model)],
     ["Avg km / Vehicle / Month", String(form.avg_km_per_vehicle_month).replace(/\B(?=(\d{3})+(?!\d))/g, ",")],
   ]);
-
   y = addSectionTitle(doc, y, "Rating Result");
   y = addKeyValueTable(doc, y, [
     ["Verdict", result.verdict || "—"],
@@ -125,7 +114,6 @@ export function generateHcvQuotePDF(form, result) {
     ["Combined Rating Factor", result.combined_rating_factor != null ? result.combined_rating_factor.toFixed(2) + "x" : "—"],
     ["Fleet Size Multiplier", result.fleet_size_multiplier != null ? result.fleet_size_multiplier.toFixed(2) + "x" : "—"],
   ]);
-
   y = addSectionTitle(doc, y, "Premium Summary");
   const totalAnnual = (result.risk_adjusted_premium || 0) + (result.management_fee || 0);
   y = addKeyValueTable(doc, y, [
@@ -135,19 +123,6 @@ export function generateHcvQuotePDF(form, result) {
     ["Total Annual Premium (incl. fee)", fmt(totalAnnual)],
     ["Monthly Premium", fmt(totalAnnual / 12)],
   ]);
-
-  y = addSectionTitle(doc, y, "SA Market Loading Breakdown");
-  y = addKeyValueTable(doc, y, [
-    ["Manufacturer (" + (form.manufacturer || "").replace(/_/g, " ") + ")", result.manufacturer_loading != null ? (result.manufacturer_loading * 100).toFixed(0) + "%" : "—"],
-    ["Vehicle Age Band (" + (result.age_band || "").replace(/_/g, " ") + ")", result.age_band_loading != null ? (result.age_band_loading * 100).toFixed(0) + "%" : "—"],
-    ["Cargo / Peril (" + (form.cargo_type || "").replace(/_/g, " ") + ")", result.cargo_loading != null ? (result.cargo_loading * 100).toFixed(0) + "%" : "—"],
-    ["Corridor / Route (" + (form.operating_corridor || "").replace(/_/g, " ") + ")", result.corridor_loading != null ? (result.corridor_loading * 100).toFixed(0) + "%" : "—"],
-    ["Anti-Theft Device Credit", result.anti_theft_credit != null ? (result.anti_theft_credit * 100).toFixed(0) + "%" : "—"],
-    ["Night Operations", result.night_ops_loading != null ? (result.night_ops_loading * 100).toFixed(0) + "%" : "—"],
-    ["Claims Experience", result.claims_experience_loading != null ? (result.claims_experience_loading * 100).toFixed(0) + "%" : "—"],
-    ["Total SA Market Loading", result.total_sa_market_loading != null ? (result.total_sa_market_loading * 100).toFixed(0) + "%" : "—"],
-  ]);
-
   y = addSectionTitle(doc, y, "Excess Structure (Section 4 — Confirmed)");
   y = addKeyValueTable(doc, y, [
     ["Own Damage", "10% of claim (min R7,500) or 6.5% of vehicle value, whichever greater"],
@@ -155,7 +130,6 @@ export function generateHcvQuotePDF(form, result) {
     ["Penalty Excess", "5% of claim (max R10,000) — night driving 23h00-04h00, driver <25yrs or licensed <3yrs, capsizing while tipping"],
     ["Tracking Requirement", "Approved Cat A or C device required for vehicles ≥ R200,000"],
   ]);
-
   addFooter(doc);
   doc.save(`ORCA_TelematiX_HCV_Quote_${(form.fleet_name || "fleet").replace(/\s+/g, "_")}_${new Date().toISOString().slice(0, 10)}.pdf`);
 }
@@ -164,7 +138,6 @@ export function generateHcvQuotePDF(form, result) {
 export function generateGitQuotePDF(form, result) {
   const doc = new jsPDF();
   let y = addHeader(doc, "GIT Goods-in-Transit — Indicative Quote", form.fleet_name || "Unnamed Fleet");
-
   y = addSectionTitle(doc, y, "Fleet Details");
   y = addKeyValueTable(doc, y, [
     ["Fleet Name", form.fleet_name || "—"],
@@ -178,12 +151,8 @@ export function generateGitQuotePDF(form, result) {
     ["Night Operations", (form.night_ops || "").replace(/_/g, " ")],
     ["Cross-Border", (form.cross_border || "").replace(/_/g, " ")],
   ]);
-
   const iotDevices = (form.iot_devices_fitted || []).map((d) => d.replace(/_/g, " ")).join(", ");
-  if (iotDevices) {
-    y = addKeyValueTable(doc, y, [["IoT Devices Fitted", iotDevices]]);
-  }
-
+  if (iotDevices) y = addKeyValueTable(doc, y, [["IoT Devices Fitted", iotDevices]]);
   y = addSectionTitle(doc, y, "Pricing Summary");
   y = addKeyValueTable(doc, y, [
     ["Base PVPM", fmt(result.base_pvpm)],
@@ -193,33 +162,13 @@ export function generateGitQuotePDF(form, result) {
     ["Total Monthly Premium", fmt(result.total_monthly_premium)],
     ["Total Annual Premium", fmt(result.annual_premium)],
   ]);
-
-  if (result.iot_credit && Array.isArray(result.iot_credit.detail) && result.iot_credit.detail.length > 0) {
-    y = addSectionTitle(doc, y, "IoT Credit Breakdown");
-    const iotRows = result.iot_credit.detail.map((line) => ["•", line]);
-    y = addKeyValueTable(doc, y, iotRows);
-  } else if (result.iot_credit && typeof result.iot_credit.detail === "string" && result.iot_credit.detail) {
-    y = addSectionTitle(doc, y, "IoT Credit Breakdown");
-    y = addKeyValueTable(doc, y, [["Note", result.iot_credit.detail]]);
-  }
-
-  y = addSectionTitle(doc, y, "Security & Scope");
-  y = addKeyValueTable(doc, y, [
-    ["High-Value Cargo", form.is_high_value_cargo ? "Yes" : "No"],
-    ["RMP1-Scoped Fleet", form.is_rmp1_scoped ? "Yes" : "No"],
-    ["Cargosnap Fitted", form.cargosnap_fitted ? "Yes" : "No"],
-    ["Security Device", (form.cvtscpi_rmp_tier || "none").replace(/_/g, " ")],
-    ["Tracking Requirement", "Approved Cat A or C device required for loads ≥ R200,000"],
-  ]);
-
   y = addSectionTitle(doc, y, "Excess Structure (Section 4 — Confirmed)");
   y = addKeyValueTable(doc, y, [
     ["Own Damage", "10% of claim (min R7,500) or 6.5% of vehicle value, whichever greater"],
     ["Theft / Hijack", "15% of claim (min R7,500)"],
     ["Penalty Excess", "5% of claim (max R10,000) — night driving 23h00-04h00, driver <25yrs or licensed <3yrs, capsizing while tipping"],
-    ["Settlement Basis", "First-loss basis, no average clause; valuation per goods type (new goods: supplier price or replacement value, whichever least)"],
+    ["Settlement Basis", "First-loss basis, no average clause"],
   ]);
-
   addFooter(doc);
   doc.save(`ORCA_TelematiX_GIT_Quote_${(form.fleet_name || "fleet").replace(/\s+/g, "_")}_${new Date().toISOString().slice(0, 10)}.pdf`);
 }
@@ -244,35 +193,75 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
   if (sharedLoadings) {
     y = addSectionTitle(doc, y, "Shared Loadings (from Fleet Information)");
     y = addKeyValueTable(doc, y, [
-      ["Geographic Zone", (sharedLoadings.geographic_zone || "").replace(/_/g, " ")],
-      ["Claims History", (sharedLoadings.claims_history || "").replace(/_/g, " ")],
-      ["Fleet Age", (sharedLoadings.fleet_age || "").replace(/_/g, " ")],
-      ["Night Operations", (sharedLoadings.night_ops || "").replace(/_/g, " ")],
-      ["Cross-Border", (sharedLoadings.cross_border || "").replace(/_/g, " ")],
-      ["Cover Type", (sharedLoadings.cover_type || "").replace(/_/g, " ")],
+      ["Geographic Zone", (sharedLoadings.geographic_zone || "—").replace(/_/g, " ")],
+      ["Claims History", (sharedLoadings.claims_history || "—").replace(/_/g, " ")],
+      ["Fleet Age", (sharedLoadings.fleet_age || "—").replace(/_/g, " ")],
+      ["Night Operations", (sharedLoadings.night_ops || "—").replace(/_/g, " ")],
+      ["Cross-Border", (sharedLoadings.cross_border || "—").replace(/_/g, " ")],
+      ["Cover Type", (sharedLoadings.cover_type || "—").replace(/_/g, " ")],
       ["IoT Devices", (sharedLoadings.iot_devices_fitted || sharedLoadings.iot_devices || []).map((d) => d.replace(/_/g, " ")).join(", ") || "—"],
     ]);
   }
 
   quotableCohorts.forEach((cohort, idx) => {
-    if (y > 220) {
-      doc.addPage();
-      y = 20;
-    }
+    if (y > 220) { doc.addPage(); y = 20; }
 
-    y = addSectionTitle(doc, y, `Cohort ${idx + 1}: ${(cohort.asset_class || "").replace(/_/g, " ")} — ${(cohort.commodity_type || "").replace(/_/g, " ")}`);
-    y = addKeyValueTable(doc, y, [
-      ["Vehicle Count", String(cohort.vehicle_count || 0)],
-      ["Load Limit / Vehicle", fmt(cohort.load_limit_per_vehicle)],
-      ["Asset Class", (cohort.asset_class || "").replace(/_/g, " ")],
-      ["Commodity Type", (cohort.commodity_type || "").replace(/_/g, " ")],
-      ["Base PVPM", fmt(cohort.base_pvpm)],
-      ["Loaded PVPM", fmt(cohort.loaded_pvpm)],
-      ["IoT Adjustment", cohort.iot_credit && cohort.iot_credit.total_credit != null ? (cohort.iot_credit.total_credit * 100).toFixed(0) + "%" : "—"],
-      ["Final PVPM", fmt(cohort.final_pvpm)],
-      ["Monthly Premium", fmt(cohort.cohort_monthly)],
-      ["Annual Premium", fmt(cohort.cohort_annual)],
-    ]);
+    const isHcv = HCV_ASSET_CLASSES.has(cohort.asset_class);
+    const isPlantAgri = PLANT_AGRI_CLASSES.has(cohort.asset_class);
+    const cohortLabel = `Cohort ${idx + 1}: ${(cohort.asset_class || "").replace(/_/g, " ")} — ${(cohort.commodity_type || "").replace(/_/g, " ")}`;
+    y = addSectionTitle(doc, y, cohortLabel);
+
+    if (isHcv) {
+      // HCV-specific breakdown
+      const mfrLoad = cohort.hcv_manufacturer_loading;
+      const ageLoad = cohort.hcv_age_loading;
+      const qualFactor = cohort.hcv_qualifier?.factor;
+      const totalSI = cohort.total_sum_insured || (cohort.hcv_sum_insured_per_vehicle || 0) * (cohort.vehicle_count || 0);
+      y = addKeyValueTable(doc, y, [
+        ["Vehicle Count", String(cohort.vehicle_count || 0)],
+        ["Sum Insured per Vehicle", fmt(cohort.hcv_sum_insured_per_vehicle)],
+        ["Total Fleet Sum Insured", fmt(totalSI)],
+        ["Manufacturer", (cohort.hcv_manufacturer || "—").replace(/_/g, " ")],
+        ["Average Vehicle Year Model", cohort.hcv_year_model ? String(cohort.hcv_year_model) : "—"],
+        ["Age Band", cohort.hcv_age_band ? cohort.hcv_age_band.replace(/_/g, " ") : "—"],
+        ["Base Rate", "4.5% p.a. of sum insured"],
+        ["Manufacturer Loading", mfrLoad != null ? (mfrLoad >= 0 ? "+" : "") + (mfrLoad * 100).toFixed(0) + "%" : "—"],
+        ["Age Band Loading", ageLoad != null ? (ageLoad >= 0 ? "+" : "") + (ageLoad * 100).toFixed(0) + "%" : "—"],
+        ["Data-Source Qualifier", cohort.hcv_qualifier?.label || "—"],
+        ["Qualifier Factor", qualFactor != null ? qualFactor.toFixed(2) + "×" : "—"],
+        ["Loss Ratio", cohort.hcv_loss_ratio_pct != null ? cohort.hcv_loss_ratio_pct.toFixed(1) + "%" : "—"],
+        ["Loss Ratio Override", cohort.hcv_loss_ratio_override_approver ? `Approved by ${cohort.hcv_loss_ratio_override_approver}` : "—"],
+        ["Monthly Premium", fmt(cohort.cohort_monthly)],
+        ["Annual Premium", fmt(cohort.cohort_annual)],
+      ]);
+    } else if (isPlantAgri) {
+      // Plant/Agri breakdown
+      y = addKeyValueTable(doc, y, [
+        ["Unit Count", String(cohort.vehicle_count || 0)],
+        ["Asset Class", (cohort.asset_class || "").replace(/_/g, " ")],
+        ["Machine Type", (cohort.agri_machine_type || "—").replace(/_/g, " ")],
+        ["Declared Value per Machine", fmt(cohort.machine_value_per_unit)],
+        ["Base Rate", cohort.asset_class === "yellow_metal_plant" ? "2.0% p.a." : "1.6% p.a."],
+        ["Rating Factor", cohort.rating_factor != null ? cohort.rating_factor.toFixed(2) + "×" : "—"],
+        ["Profile", cohort.profile || "—"],
+        ["Monthly Premium", fmt(cohort.cohort_monthly)],
+        ["Annual Premium", fmt(cohort.cohort_annual)],
+      ]);
+    } else {
+      // GIT breakdown
+      y = addKeyValueTable(doc, y, [
+        ["Vehicle Count", String(cohort.vehicle_count || 0)],
+        ["Load Limit / Vehicle", fmt(cohort.load_limit_per_vehicle)],
+        ["Asset Class", (cohort.asset_class || "").replace(/_/g, " ")],
+        ["Commodity Type", (cohort.commodity_type || "").replace(/_/g, " ")],
+        ["Base PVPM", fmt(cohort.base_pvpm)],
+        ["Loaded PVPM", fmt(cohort.loaded_pvpm)],
+        ["IoT Adjustment", cohort.iot_credit && cohort.iot_credit.total_credit != null ? (cohort.iot_credit.total_credit * 100).toFixed(0) + "%" : "—"],
+        ["Final PVPM", fmt(cohort.final_pvpm)],
+        ["Monthly Premium", fmt(cohort.cohort_monthly)],
+        ["Annual Premium", fmt(cohort.cohort_annual)],
+      ]);
+    }
   });
 
   const referredCohorts = cohorts.filter((c) => c.status === "REFER");
