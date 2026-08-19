@@ -128,7 +128,7 @@ export function generateHcvQuotePDF(form, result) {
     ["Own Damage", "10% of claim (min R7,500) or 6.5% of vehicle value, whichever greater"],
     ["Theft / Hijack", "15% of claim (min R7,500)"],
     ["Penalty Excess", "5% of claim (max R10,000) — night driving 23h00-04h00, driver <25yrs or licensed <3yrs, capsizing while tipping"],
-    ["Tracking Requirement", "Approved Cat A or C device required for vehicles ≥ R200,000"],
+    ["Tracking Requirement", "Approved Cat A or C device required for vehicles >= R200,000"],
   ]);
   addFooter(doc);
   doc.save(`ORCA_TelematiX_HCV_Quote_${(form.fleet_name || "fleet").replace(/\s+/g, "_")}_${new Date().toISOString().slice(0, 10)}.pdf`);
@@ -283,7 +283,7 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
     ["Own Damage", "10% of claim (min R7,500) or 6.5% of vehicle value, whichever greater"],
     ["Theft / Hijack", "15% of claim (min R7,500)"],
     ["Penalty Excess", "5% of claim (max R10,000) — night driving 23h00-04h00, driver <25yrs or licensed <3yrs, capsizing while tipping"],
-    ["Tracking Requirement", "Approved Cat A or C device required for vehicles ≥ R200,000"],
+    ["Tracking Requirement", "Approved Cat A or C device required for vehicles >= R200,000"],
     ["Settlement Basis", "First-loss basis, no average clause"],
   ]);
 
