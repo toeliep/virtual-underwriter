@@ -132,6 +132,7 @@ const HCV_AGE_BAND_LOADINGS = {
 };
 const HCV_BASE_RATE = 0.045;
 const HCV_MIN_ANNUAL_PREMIUM = 5000;
+const HCV_MANUFACTURER_LOADING_DEFAULT = 0.10; // default for unknown manufacturers
 
 function classifyHcvAgeBandMC(yearModel) {
   const age = new Date().getFullYear() - (yearModel || 2020);
@@ -143,7 +144,69 @@ function classifyHcvAgeBandMC(yearModel) {
   return "over_15yr";
 }
 
-function priceHcvCohort(cohort) {
+function priceVehicle(vehicle, qualFactor) {
+  // Price a single vehicle from the register
+  const si = vehicle.insured_value || 0;
+  if (si <= 0) return { ...vehicle, annual: 0, monthly: 0 };
+
+  const mfrKey = (vehicle.make || "other").toLowerCase().replace(/[^a-z]/g, "_").replace(/-/g, "_");
+  const mfrMap = {
+    scania: "scania", mercedes_benz: "mercedes_benz", "mercedes-benz": "mercedes_benz",
+    freightliner: "freightliner", volvo: "volvo", man: "man", daf: "daf",
+    faw: "faw", hino: "hino", isuzu: "isuzu", western_star: "western_star",
+  };
+  const mfrLoad = HCV_MANUFACTURER_LOADINGS[mfrMap[mfrKey] || "other"] ?? HCV_MANUFACTURER_LOADING_DEFAULT;
+  const ageBand = classifyHcvAgeBandMC(vehicle.year);
+  const ageLoad = HCV_AGE_BAND_LOADINGS[ageBand] ?? 0;
+
+  const annual = si * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qualFactor;
+  return {
+    ...vehicle,
+    mfr_loading: mfrLoad,
+    age_band: ageBand,
+    age_loading: ageLoad,
+    annual: Math.round(annual * 100) / 100,
+    monthly: Math.round(annual / 12 * 100) / 100,
+  };
+}
+
+function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo) {
+  // Loss ratio gate
+  const lr = cohort.hcv_loss_ratio_pct;
+  if (lr != null && lr > 65 && !cohort.hcv_loss_ratio_override_approver) {
+    return { ...cohort, status: "REFER", referral_reason: `Loss ratio ${lr.toFixed(1)}% exceeds 65% threshold. Enter approver name to override.`, cohort_monthly: null, cohort_annual: null };
+  }
+
+  const ds = cohort.hcv_data_source || "none";
+  const qual = HCV_QUALIFIER[ds] || HCV_QUALIFIER.none;
+
+  // Check if we have a vehicle register for per-vehicle pricing
+  const register = (sharedFleetInfo?.vehicle_register || sharedInfo?.vehicle_register || []);
+  const hcvVehicles = register.filter(v => v.asset_type === "hcv" && (v.insured_value || 0) > 0);
+
+  if (hcvVehicles.length > 0) {
+    // PER-VEHICLE PRICING
+    const pricedVehicles = hcvVehicles.map(v => priceVehicle(v, qual.factor));
+    const totalAnnual = pricedVehicles.reduce((s, v) => s + v.annual, 0);
+    const totalSI = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0), 0);
+    const minApplied = totalAnnual < HCV_MIN_ANNUAL_PREMIUM;
+    const finalAnnual = minApplied ? HCV_MIN_ANNUAL_PREMIUM : totalAnnual;
+
+    return {
+      ...cohort,
+      status: "QUOTABLE",
+      hcv_qualifier: qual,
+      total_sum_insured: totalSI,
+      vehicle_count: hcvVehicles.length,
+      priced_vehicles: pricedVehicles,
+      cohort_monthly: Math.round(finalAnnual / 12 * 100) / 100,
+      cohort_annual: Math.round(finalAnnual * 100) / 100,
+      min_premium_applied: minApplied,
+      pricing_mode: "per_vehicle",
+    };
+  }
+
+  // FALLBACK: cohort-level pricing (no register)
   const count = cohort.vehicle_count || 0;
   const siPerVeh = cohort.hcv_sum_insured_per_vehicle || 0;
   const sumInsured = siPerVeh * count;
@@ -152,14 +215,6 @@ function priceHcvCohort(cohort) {
     return { ...cohort, status: "REFER", referral_reason: "Enter sum insured per vehicle and vehicle count to price this cohort.", cohort_monthly: null, cohort_annual: null };
   }
 
-  // Loss ratio gate (65% threshold — Frans/Hollard confirmed)
-  const lr = cohort.hcv_loss_ratio_pct;
-  if (lr != null && lr > 65 && !cohort.hcv_loss_ratio_override_approver) {
-    return { ...cohort, status: "REFER", referral_reason: `Loss ratio ${lr.toFixed(1)}% exceeds 65% threshold. Enter approver name to override.`, cohort_monthly: null, cohort_annual: null };
-  }
-
-  const ds = cohort.hcv_data_source || "none";
-  const qual = HCV_QUALIFIER[ds] || HCV_QUALIFIER.none;
   const mfr = cohort.hcv_manufacturer || "mercedes_benz";
   const mfrLoad = HCV_MANUFACTURER_LOADINGS[mfr] ?? 0;
   const ageBand = classifyHcvAgeBandMC(cohort.hcv_year_model);
@@ -178,8 +233,9 @@ function priceHcvCohort(cohort) {
     hcv_age_loading: ageLoad,
     total_sum_insured: sumInsured,
     cohort_monthly: Math.round(annual / 12 * 100) / 100,
-    cohort_annual:  Math.round(annual * 100) / 100,
+    cohort_annual: Math.round(annual * 100) / 100,
     min_premium_applied: minApplied,
+    pricing_mode: "cohort_level",
   };
 }
 
@@ -370,35 +426,57 @@ const TRAILER_TYPE_LABELS = {
   other: "Other / Unspecified",
 };
 
-function priceTrailerCohort(cohort) {
+function priceTrailerCohort(cohort, sharedFleetInfo) {
+  // Try per-vehicle pricing from register first
+  const register = sharedFleetInfo?.vehicle_register || [];
+  const trailers = register.filter(v => v.asset_type === "trailer" && (v.insured_value || 0) > 0);
+
+  if (trailers.length > 0) {
+    const pricedTrailers = trailers.map(v => {
+      const annual = (v.insured_value || 0) * TRAILER_BASE_RATE;
+      return { ...v, annual: Math.round(annual * 100) / 100, monthly: Math.round(annual / 12 * 100) / 100 };
+    });
+    const totalAnnual = pricedTrailers.reduce((s, v) => s + v.annual, 0);
+    const totalSI = pricedTrailers.reduce((s, v) => s + (v.insured_value || 0), 0);
+    const minApplied = totalAnnual < TRAILER_MIN_ANNUAL_PREMIUM;
+    const finalAnnual = minApplied ? TRAILER_MIN_ANNUAL_PREMIUM : totalAnnual;
+    return {
+      ...cohort,
+      status: "QUOTABLE",
+      trailer_total_si: totalSI,
+      vehicle_count: trailers.length,
+      priced_trailers: pricedTrailers,
+      cohort_monthly: Math.round(finalAnnual / 12 * 100) / 100,
+      cohort_annual: Math.round(finalAnnual * 100) / 100,
+      min_premium_applied: minApplied,
+      pricing_mode: "per_vehicle",
+    };
+  }
+
+  // Fallback: cohort-level
   const count = cohort.vehicle_count || 0;
   const siPerUnit = cohort.trailer_sum_insured_per_unit || 0;
   const totalSI = siPerUnit * count;
-
   if (totalSI <= 0 || count <= 0) {
     return { ...cohort, status: "REFER", referral_reason: "Enter sum insured per trailer and unit count to price this cohort.", cohort_monthly: null, cohort_annual: null };
   }
-
   let annual = totalSI * TRAILER_BASE_RATE;
   let minApplied = false;
   if (annual < TRAILER_MIN_ANNUAL_PREMIUM) { annual = TRAILER_MIN_ANNUAL_PREMIUM; minApplied = true; }
-
   return {
-    ...cohort,
-    status: "QUOTABLE",
-    trailer_total_si: totalSI,
+    ...cohort, status: "QUOTABLE", trailer_total_si: totalSI,
     cohort_monthly: Math.round(annual / 12 * 100) / 100,
     cohort_annual: Math.round(annual * 100) / 100,
-    min_premium_applied: minApplied,
+    min_premium_applied: minApplied, pricing_mode: "cohort_level",
   };
 }
 
-function priceCohort(cohort, sharedFields) {
+function priceCohort(cohort, sharedFields, sharedFleetInfo) {
   const cls = cohort.asset_class || "hcv_general_freight";
   if (cls === "yellow_metal_plant") return pricePlantCohort(cohort);
   if (cls === "agricultural_equipment") return priceAgriCohort(cohort);
-  if (cls === "trailer") return priceTrailerCohort(cohort);
-  if (HCV_ASSET_CLASSES.has(cls)) return priceHcvCohort(cohort, sharedFields);
+  if (cls === "trailer") return priceTrailerCohort(cohort, sharedFleetInfo);
+  if (HCV_ASSET_CLASSES.has(cls)) return priceHcvCohort(cohort, sharedFields, sharedFleetInfo);
   return priceGitCohort(cohort, sharedFields);
 }
 
@@ -526,13 +604,38 @@ export default function MultiCohortView({ sharedFleetInfo }) {
   const shared = sharedFleetInfo || {};
   const [cohorts, setCohorts] = useState(() => [makeCohort(0, shared)]);
 
-  // Reset to single fresh cohort ONLY when fleet_name changes (i.e. a new fleet was saved)
+  // Reset cohorts when fleet_name changes — auto-create trailer cohort from vehicle register
   const prevFleetNameRef = useRef(shared?.fleet_name);
   React.useEffect(() => {
     const newName = shared?.fleet_name;
     if (newName && newName !== prevFleetNameRef.current) {
       prevFleetNameRef.current = newName;
-      setCohorts([makeCohort(0, shared)]);
+      const hcvCohort = makeCohort(0, shared);
+      const newCohorts = [hcvCohort];
+
+      // Compute trailer data directly from vehicle register
+      const register = shared?.vehicle_register || [];
+      const trailers = register.filter(v => v.asset_type === "trailer" && (v.insured_value || 0) > 0);
+      const trailerCount = trailers.length;
+      const trailerTotalSI = trailers.reduce((s, v) => s + (v.insured_value || 0), 0);
+      const trailerAvgSI = trailerCount > 0 ? Math.round(trailerTotalSI / trailerCount) : 0;
+
+      // Fallback to explicit fields if register has no trailers
+      const useTrailerCount = trailerCount > 0 ? trailerCount : (shared?.trailer_count || 0);
+      const useTrailerAvgSI = trailerCount > 0 ? trailerAvgSI : (shared?.trailer_avg_sum_insured || 0);
+
+      if (useTrailerCount > 0 && useTrailerAvgSI > 0) {
+        const trailerCohort = {
+          ...makeCohort(1, shared),
+          asset_class: "trailer",
+          vehicle_count: useTrailerCount,
+          trailer_sum_insured_per_unit: useTrailerAvgSI,
+          trailer_type: "tautliner",
+          label: "Cohort 2",
+        };
+        newCohorts.push(trailerCohort);
+      }
+      setCohorts(newCohorts);
     }
   }, [shared?.fleet_name]);
   const [expandedCohort, setExpandedCohort] = useState(0);
@@ -681,7 +784,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
   // Price all cohorts
   const pricedCohorts = useMemo(() => {
     return cohorts.map((c) => {
-      const priced = priceCohort(c, sharedFields);
+      const priced = priceCohort(c, sharedFields, shared);
       const underwriting = computeUnderwritingStatus(c);
 
       // ORCA underwriting gate: absolute-excluded commodity or failed
@@ -1458,35 +1561,105 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       </>
                     ) : isTrailer ? (
                       <>
-                        <div>Total sum insured: R{cohort.trailer_total_si?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-                        <div>Trailer type: {TRAILER_TYPE_LABELS[cohort.trailer_type] || "Tautliner"}</div>
-                        <div>Base rate: {(TRAILER_BASE_RATE * 100).toFixed(1)}% p.a. of sum insured</div>
-                        <div>Own damage excess: 10% min R15,000</div>
-                        <div>Theft / hijack excess: 15% min R7,500</div>
-                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
-                          <strong>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</strong>
-                          {cohort.min_premium_applied && <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>}
-                        </div>
+                        <div>Base rate: {(TRAILER_BASE_RATE * 100).toFixed(1)}% p.a. · Own damage: 10% min R15,000 · Theft/hijack: 15% min R7,500</div>
+                        {cohort.pricing_mode === "per_vehicle" && cohort.priced_trailers?.length > 0 ? (
+                          <div style={{ marginTop: "8px", overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.74rem" }}>
+                              <thead>
+                                <tr style={{ background: "#14213D", color: "#FAF7F0" }}>
+                                  {["Reg","Make","Model","Year","Sum Insured","Monthly","Annual"].map(h => (
+                                    <th key={h} style={{ padding: "4px 6px", textAlign: h === "Sum Insured" || h === "Monthly" || h === "Annual" ? "right" : "left" }}>{h}</th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {cohort.priced_trailers.map((v, i) => (
+                                  <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : "#F5F7FA" }}>
+                                    <td style={{ padding: "3px 6px" }}>{v.registration}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.make}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.model}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.year}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right" }}>R{(v.insured_value || 0).toLocaleString("en-ZA")}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right", fontWeight: 600 }}>R{v.monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right" }}>R{v.annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                              <tfoot>
+                                <tr style={{ background: "#E8EDF5", fontWeight: 700 }}>
+                                  <td colSpan={4} style={{ padding: "4px 6px" }}>TOTAL ({cohort.priced_trailers.length} trailers)</td>
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.trailer_total_si?.toLocaleString("en-ZA")}</td>
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</td>
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/yr</td>
+                                </tr>
+                              </tfoot>
+                            </table>
+                            {cohort.min_premium_applied && <div style={{ color: "#B5762A", fontSize: "0.74rem", marginTop: "4px" }}>(min R5,000/yr applied)</div>}
+                          </div>
+                        ) : (
+                          <>
+                            <div>Total sum insured: R{cohort.trailer_total_si?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                            <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                              <strong>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</strong>
+                              {cohort.min_premium_applied && <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>}
+                            </div>
+                          </>
+                        )}
                       </>
                     ) : isHcv ? (
                       <>
-                        <div>Total sum insured: R{cohort.total_sum_insured?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-                        <div>Base rate: {(HCV_BASE_RATE * 100).toFixed(1)}% p.a. of sum insured</div>
-                        <div>Manufacturer loading: {cohort.hcv_manufacturer_loading != null ? ((cohort.hcv_manufacturer_loading >= 0 ? "+" : "") + (cohort.hcv_manufacturer_loading * 100).toFixed(0) + "%") : "0%"}</div>
-                        <div>Age band loading: {cohort.hcv_age_band?.replace(/_/g, " ")} — {cohort.hcv_age_loading != null ? ((cohort.hcv_age_loading >= 0 ? "+" : "") + (cohort.hcv_age_loading * 100).toFixed(0) + "%") : "0%"}</div>
-                        <div>Data-source qualifier: {cohort.hcv_qualifier?.factor?.toFixed(2)}× ({cohort.hcv_qualifier?.label})</div>
+                        <div>Base rate: {(HCV_BASE_RATE * 100).toFixed(1)}% p.a. · Data-source qualifier: {cohort.hcv_qualifier?.factor?.toFixed(2)}× ({cohort.hcv_qualifier?.label})</div>
                         {cohort.hcv_loss_ratio_override_approver && (
                           <div style={{ color: "#B5762A" }}>Loss ratio override: approved by {cohort.hcv_loss_ratio_override_approver}</div>
                         )}
-                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
-                          <strong>
-                            Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                            {" · "}Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo
-                          </strong>
-                          {cohort.min_premium_applied && (
-                            <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>
-                          )}
-                        </div>
+                        {cohort.pricing_mode === "per_vehicle" && cohort.priced_vehicles?.length > 0 ? (
+                          <div style={{ marginTop: "8px", overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.74rem" }}>
+                              <thead>
+                                <tr style={{ background: "#14213D", color: "#FAF7F0" }}>
+                                  {["Reg","Make","Model","Year","Sum Insured","Mfr","Age Band","Monthly","Annual"].map(h => (
+                                    <th key={h} style={{ padding: "4px 6px", textAlign: h === "Sum Insured" || h === "Monthly" || h === "Annual" ? "right" : "left", whiteSpace: "nowrap" }}>{h}</th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {cohort.priced_vehicles.map((v, i) => (
+                                  <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : "#F5F7FA" }}>
+                                    <td style={{ padding: "3px 6px" }}>{v.registration}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.make}</td>
+                                    <td style={{ padding: "3px 6px", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.model}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.year}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right" }}>R{(v.insured_value || 0).toLocaleString("en-ZA")}</td>
+                                    <td style={{ padding: "3px 6px" }}>{v.mfr_loading != null ? ((v.mfr_loading >= 0 ? "+" : "") + (v.mfr_loading * 100).toFixed(0) + "%") : ""}</td>
+                                    <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>{v.age_band?.replace(/_/g, " ")} {v.age_loading != null ? ((v.age_loading >= 0 ? "+" : "") + (v.age_loading * 100).toFixed(0) + "%") : ""}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right", fontWeight: 600 }}>R{v.monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                    <td style={{ padding: "3px 6px", textAlign: "right" }}>R{v.annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                              <tfoot>
+                                <tr style={{ background: "#E8EDF5", fontWeight: 700 }}>
+                                  <td colSpan={4} style={{ padding: "4px 6px", fontSize: "0.75rem" }}>TOTAL ({cohort.priced_vehicles.length} vehicles)</td>
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.total_sum_insured?.toLocaleString("en-ZA")}</td>
+                                  <td colSpan={2} />
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</td>
+                                  <td style={{ padding: "4px 6px", textAlign: "right" }}>R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/yr</td>
+                                </tr>
+                              </tfoot>
+                            </table>
+                            {cohort.min_premium_applied && <div style={{ color: "#B5762A", fontSize: "0.74rem", marginTop: "4px" }}>(min R5,000/yr applied)</div>}
+                          </div>
+                        ) : (
+                          <>
+                            <div>Total sum insured: R{cohort.total_sum_insured?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                            <div>Manufacturer loading: {cohort.hcv_manufacturer_loading != null ? ((cohort.hcv_manufacturer_loading >= 0 ? "+" : "") + (cohort.hcv_manufacturer_loading * 100).toFixed(0) + "%") : "0%"}</div>
+                            <div>Age band: {cohort.hcv_age_band?.replace(/_/g, " ")} — {cohort.hcv_age_loading != null ? ((cohort.hcv_age_loading >= 0 ? "+" : "") + (cohort.hcv_age_loading * 100).toFixed(0) + "%") : "0%"}</div>
+                            <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                              <strong>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</strong>
+                              {cohort.min_premium_applied && <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>}
+                            </div>
+                          </>
+                        )}
                       </>
                     ) : (
                       <>

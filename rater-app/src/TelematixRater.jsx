@@ -252,6 +252,10 @@ function makeGitFleetInput(overrides) {
   return {
     fleet_name: "",
     vehicle_count: 0,
+    hcv_truck_count: 0,
+    trailer_count: 0,
+    hcv_truck_avg_sum_insured: 0,
+    trailer_avg_sum_insured: 0,
     load_limit_per_vehicle: 0,
     commodity_type: "general_cargo",
     geographic_zone: "western_cape",
@@ -259,6 +263,7 @@ function makeGitFleetInput(overrides) {
     fleet_age: "new",
     night_ops: "under_30pct",
     cross_border: "local",
+    vehicle_register: [],
     loss_ratio_pct: null, // v2: actual loss ratio %, if known. null = not yet available.
     fleet_age: "new",
     night_ops: "under_30pct",
@@ -1436,7 +1441,7 @@ function makeFleetInfoDefaults() {
     asset_class: "hcv_general_freight",
     avg_sum_insured_per_vehicle: 0,
     manufacturer: "mercedes_benz",
-    year_model: new Date().getFullYear(),
+    year_model: null,
     avg_km_per_vehicle_month: 0,
     cargo_type: "general_merchandise",
     operating_corridor: "mixed_sa_national",
@@ -1513,18 +1518,30 @@ CRITICAL PRIVACY RULE: Never extract, repeat, or reference any personal identify
 
 Extract ONLY what is explicitly stated in the document. Do not guess or invent values that aren't grounded in the document.
 
-IMPORTANT DISTINCTION for vehicle_count and avg_sum_insured_per_vehicle specifically: if the document lists individual vehicles/assets in a table or schedule (even across multiple categories like trucks, trailers, other), COUNT the listed line items and SUM their individual values yourself — this is arithmetic on visible data, not a guess, and you should always do it rather than leaving these two fields null. Only leave vehicle_count or avg_sum_insured_per_vehicle null if the document truly contains no vehicle listing or values at all. Briefly note your counting/summing method in extraction_notes so it can be checked. For every OTHER field (asset_class, cargo_type, manufacturer, corridor, etc.), remain conservative: only fill from what's explicitly stated or a clear closest-match, and set to null if genuinely unclear.
+CRITICAL VEHICLE SPLIT RULE: South African fleet schedules almost always contain BOTH HCV trucks AND trailers in the same document. You MUST split them:
+- hcv_truck_count: count ONLY the HCV motor vehicles (trucks, tractors, horse units). Look for section headers like "HCV", "TRUCKS", "MOTOR VEHICLES", "HORSE UNITS" or asset descriptions containing "ACTROS", "ARGOSY", "SCANIA", "VOLVO FH", "FREIGHTLINER", "INTERNATIONAL", "MAN TGA", "FAW", etc. Do NOT count trailers, LDVs, bakkies, or light vehicles here.
+- trailer_count: count ONLY trailers, semi-trailers, and interlinks. Look for section headers like "TRAILERS", "SEMI-TRAILERS" or descriptions containing "TAUTLINER", "FLATDECK", "SIDE TIPPER", "INTERLINK", "AFRIT", "GRW", "SATB", "HENRED".
+- hcv_truck_avg_sum_insured: sum the insured values of HCV trucks only, divide by hcv_truck_count.
+- trailer_avg_sum_insured: sum the insured values of trailers only, divide by trailer_count.
+- vehicle_count: set to hcv_truck_count (HCV trucks only — trailers are rated separately).
+- avg_sum_insured_per_vehicle: set to hcv_truck_avg_sum_insured.
+If no section header exists, use asset descriptions to classify. Note your classification in extraction_notes.
+For every OTHER field, remain conservative: only fill from what's explicitly stated or a clear closest-match, and set to null if genuinely unclear.
 
 Map the extracted values to the closest matching option from the allowed values listed below. If no option matches, use the closest reasonable match and note it in extraction_notes.
 
 Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
 {
   "fleet_name": string or null,
+  "hcv_truck_count": number or null,
+  "trailer_count": number or null,
+  "hcv_truck_avg_sum_insured": number or null,
+  "trailer_avg_sum_insured": number or null,
   "vehicle_count": number or null,
   "asset_class": one of ["hcv_general_freight","fuel_hazmat_tanker","minerals_bulk_long_haul","fmcg_distribution","bulk_liquids_non_hazmat","yellow_metal_plant","agricultural_equipment","refrigerated_cold_chain","abnormal_loads_oversized","drone_commercial"] or null,
   "avg_sum_insured_per_vehicle": number or null,
   "manufacturer": one of ["daf","faw","freightliner","hino","isuzu","man","mercedes_benz","other","scania","ud_trucks","volvo","western_star"] or null,
-  "year_model": number (4-digit year) or null,
+  "year_model": number (4-digit year, computed as the arithmetic average of all HCV truck year models rounded to nearest year — e.g. if trucks are 2003, 2006, 2007, 2010, 2013, 2003 then average = (2003+2006+2007+2010+2013+2003)/6 = 2007; always compute this if individual years are visible, do not leave null) or null,
   "avg_km_per_vehicle_month": number or null,
   "cargo_type": one of ["agricultural_produce","chemicals_hazmat_adr","chemicals_non_hazmat","electronics_high_value","fmcg_food_bev","fuel_petroleum","general_merchandise","livestock","minerals_mining","refrigerated","retail_clothing","steel_metals"] or null,
   "operating_corridor": one of ["cross_border_sadc","kwazulu_natal_regional","mixed_sa_national","n1_cape_johannesburg","n1_north_limpopo_zimbabwe_border","n12_east_rand_port_elizabeth","n14_n4_botswana_border","n3_johannesburg_durban","northern_cape_manganese_routes","western_cape_regional"] or null,
@@ -1541,8 +1558,31 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
   "is_rmp1_scoped": boolean or null,
   "cargosnap_fitted": boolean or null,
   "security_device": one of ["none","rmp1_top_lock","rmp2_cable_lock","rmp3_tracktag"] or null,
+  "vehicle_register": [
+    {
+      "registration": string,
+      "make": string,
+      "model": string,
+      "year": number,
+      "insured_value": number,
+      "cover": "comp" | "specified" | "tpl_only",
+      "asset_type": "hcv" | "trailer" | "ldv" | "other"
+    }
+  ] or [],
   "extraction_notes": string
-}`;
+}\`;
+
+VEHICLE REGISTER RULES:
+- Always populate vehicle_register from any vehicle schedule in the document.
+- List EVERY vehicle and trailer individually — one object per line item.
+- asset_type: "hcv" for trucks/horses/tractors, "trailer" for all trailer types, "ldv" for bakkies/light vehicles, "other" for anything else.
+- cover: "comp" for comprehensive, "specified" for specified perils, "tpl_only" for TPL only.
+- insured_value: the individual agreed/retail/market value per vehicle from the schedule.
+- registration: the reg number as printed. If not visible, use "unknown".
+- make: the manufacturer name (e.g. "Scania", "Freightliner", "Mercedes-Benz").
+- model: the full model description as printed (e.g. "R420 CA 6X4 ESZ T/T C/C").
+- year: the model year as a 4-digit integer.
+- Do NOT group vehicles — one row per vehicle, always.`;
 
   const processDocument = useCallback(async (file) => {
     if (!file) return;
@@ -1667,8 +1707,44 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
       // Map extracted values into form fields (only overwrite non-null extractions)
       setForm((prev) => {
         const updated = { ...prev };
+        if (extracted.vehicle_register && extracted.vehicle_register.length > 0) {
+          updated.vehicle_register = extracted.vehicle_register;
+          // Auto-compute truck/trailer splits from register
+          const trucks = extracted.vehicle_register.filter(v => v.asset_type === "hcv");
+          const trailers = extracted.vehicle_register.filter(v => v.asset_type === "trailer");
+          if (trucks.length > 0) {
+            updated.hcv_truck_count = trucks.length;
+            updated.vehicle_count = trucks.length;
+            const truckSI = trucks.reduce((s, v) => s + (v.insured_value || 0), 0);
+            updated.hcv_truck_avg_sum_insured = Math.round(truckSI / trucks.length);
+            updated.avg_sum_insured_per_vehicle = Math.round(truckSI / trucks.length);
+            // Average year model from truck years
+            const years = trucks.map(v => v.year).filter(y => y > 1980 && y <= 2030);
+            if (years.length > 0) updated.year_model = Math.round(years.reduce((s, y) => s + y, 0) / years.length);
+            // Dominant manufacturer
+            const makes = trucks.map(v => v.make?.toLowerCase());
+            const makeCount = {};
+            makes.forEach(m => { makeCount[m] = (makeCount[m] || 0) + 1; });
+            const dominant = Object.entries(makeCount).sort((a, b) => b[1] - a[1])[0]?.[0];
+            const mfrMap = { scania: "scania", "mercedes-benz": "mercedes_benz", mercedesbenz: "mercedes_benz", freightliner: "freightliner", volvo: "volvo", man: "man", daf: "daf", faw: "faw", hino: "hino", isuzu: "isuzu", international: "other", western_star: "western_star" };
+            updated.manufacturer = mfrMap[dominant] || "other";
+          }
+          if (trailers.length > 0) {
+            updated.trailer_count = trailers.length;
+            const trailerSI = trailers.reduce((s, v) => s + (v.insured_value || 0), 0);
+            updated.trailer_avg_sum_insured = Math.round(trailerSI / trailers.length);
+          }
+        }
         if (extracted.fleet_name) updated.fleet_name = extracted.fleet_name;
-        if (extracted.vehicle_count != null) updated.vehicle_count = extracted.vehicle_count;
+        if (extracted.hcv_truck_count != null) updated.hcv_truck_count = extracted.hcv_truck_count;
+        if (extracted.trailer_count != null) updated.trailer_count = extracted.trailer_count;
+        if (extracted.hcv_truck_avg_sum_insured != null) updated.hcv_truck_avg_sum_insured = extracted.hcv_truck_avg_sum_insured;
+        if (extracted.trailer_avg_sum_insured != null) updated.trailer_avg_sum_insured = extracted.trailer_avg_sum_insured;
+        // vehicle_count and avg_sum_insured now come from truck-specific fields
+        if (extracted.hcv_truck_count != null) updated.vehicle_count = extracted.hcv_truck_count;
+        if (extracted.hcv_truck_avg_sum_insured != null) updated.avg_sum_insured_per_vehicle = extracted.hcv_truck_avg_sum_insured;
+        // Fallback: if no truck/trailer split available, use total
+        if (extracted.hcv_truck_count == null && extracted.vehicle_count != null) updated.vehicle_count = extracted.vehicle_count;
         if (extracted.asset_class) updated.asset_class = extracted.asset_class;
         if (extracted.avg_sum_insured_per_vehicle != null) updated.avg_sum_insured_per_vehicle = extracted.avg_sum_insured_per_vehicle;
         if (extracted.manufacturer) updated.manufacturer = extracted.manufacturer;
@@ -1852,13 +1928,29 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
           </FormField>
           <FormField label="Average vehicle year model">
             <input
-              type="number" min="1980" max="2030" step="1"
+              type="text"
+              inputMode="numeric"
+              placeholder="e.g. 2015"
               onFocus={(e) => setTimeout(() => e.target.select(), 0)}
-              value={form.year_model || ""}
+              value={form._year_model_raw !== undefined ? form._year_model_raw : (form.year_model || "")}
               onChange={(e) => {
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v) && v >= 1980 && v <= 2030) updateField("year_model", v);
-                else if (e.target.value === "") updateField("year_model", new Date().getFullYear());
+                const raw = e.target.value.replace(/[^0-9]/g, "").slice(0, 4);
+                setForm(f => ({ ...f, _year_model_raw: raw }));
+                if (raw.length === 4) {
+                  const v = parseInt(raw, 10);
+                  if (v >= 1980 && v <= 2030) setForm(f => ({ ...f, year_model: v, _year_model_raw: undefined }));
+                } else if (raw === "") {
+                  setForm(f => ({ ...f, year_model: null, _year_model_raw: undefined }));
+                }
+              }}
+              onBlur={(e) => {
+                const raw = e.target.value.replace(/[^0-9]/g, "");
+                const v = parseInt(raw, 10);
+                if (!isNaN(v) && v >= 1980 && v <= 2030) {
+                  setForm(f => ({ ...f, year_model: v, _year_model_raw: undefined }));
+                } else {
+                  setForm(f => ({ ...f, year_model: null, _year_model_raw: undefined }));
+                }
               }}
               onWheel={(e) => e.target.blur()}
               style={formInputStyle} />
@@ -2156,6 +2248,108 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
             </select>
           </FormField>
         </div>
+      </div>
+
+      {/* Vehicle Register Table */}
+      <div style={{ marginBottom: "20px" }}>
+        <SectionLabel>Vehicle Register</SectionLabel>
+        <div style={{ fontSize: "0.78rem", color: "#5C6570", marginBottom: "10px" }}>
+          Auto-populated from document upload. Add, edit, or remove rows. Each vehicle is priced individually in Multi-Cohort.
+        </div>
+        {(form.vehicle_register || []).length > 0 ? (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.78rem" }}>
+              <thead>
+                <tr style={{ background: "#14213D", color: "#FAF7F0" }}>
+                  {["Type","Reg","Make","Model","Year","Insured Value (R)","Cover",""].map(h => (
+                    <th key={h} style={{ padding: "6px 8px", textAlign: "left", whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {(form.vehicle_register || []).map((v, i) => (
+                  <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : "#F5F7FA" }}>
+                    <td style={{ padding: "4px 8px" }}>
+                      <select value={v.asset_type || "hcv"} onChange={e => {
+                        const reg = [...(form.vehicle_register || [])];
+                        reg[i] = { ...reg[i], asset_type: e.target.value };
+                        setForm(f => ({ ...f, vehicle_register: reg }));
+                      }} style={{ fontSize: "0.75rem", padding: "2px 4px", border: "1px solid #C8D0DC", borderRadius: "3px" }}>
+                        <option value="hcv">HCV</option>
+                        <option value="trailer">Trailer</option>
+                        <option value="ldv">LDV</option>
+                        <option value="other">Other</option>
+                      </select>
+                    </td>
+                    {["registration","make","model"].map(field => (
+                      <td key={field} style={{ padding: "4px 8px" }}>
+                        <input type="text" value={v[field] || ""} onChange={e => {
+                          const reg = [...(form.vehicle_register || [])];
+                          reg[i] = { ...reg[i], [field]: e.target.value };
+                          setForm(f => ({ ...f, vehicle_register: reg }));
+                        }} style={{ fontSize: "0.75rem", padding: "2px 4px", border: "1px solid #C8D0DC", borderRadius: "3px", width: field === "model" ? "140px" : "80px" }} />
+                      </td>
+                    ))}
+                    <td style={{ padding: "4px 8px" }}>
+                      <input type="text" value={v.year || ""} onChange={e => {
+                        const reg = [...(form.vehicle_register || [])];
+                        reg[i] = { ...reg[i], year: parseInt(e.target.value) || null };
+                        setForm(f => ({ ...f, vehicle_register: reg }));
+                      }} style={{ fontSize: "0.75rem", padding: "2px 4px", border: "1px solid #C8D0DC", borderRadius: "3px", width: "50px" }} />
+                    </td>
+                    <td style={{ padding: "4px 8px" }}>
+                      <input type="number" value={v.insured_value || ""} onChange={e => {
+                        const reg = [...(form.vehicle_register || [])];
+                        reg[i] = { ...reg[i], insured_value: parseInt(e.target.value) || 0 };
+                        setForm(f => ({ ...f, vehicle_register: reg }));
+                      }} style={{ fontSize: "0.75rem", padding: "2px 4px", border: "1px solid #C8D0DC", borderRadius: "3px", width: "90px" }} />
+                    </td>
+                    <td style={{ padding: "4px 8px" }}>
+                      <select value={v.cover || "comp"} onChange={e => {
+                        const reg = [...(form.vehicle_register || [])];
+                        reg[i] = { ...reg[i], cover: e.target.value };
+                        setForm(f => ({ ...f, vehicle_register: reg }));
+                      }} style={{ fontSize: "0.75rem", padding: "2px 4px", border: "1px solid #C8D0DC", borderRadius: "3px" }}>
+                        <option value="comp">Comp</option>
+                        <option value="specified">Specified</option>
+                        <option value="tpl_only">TPL</option>
+                      </select>
+                    </td>
+                    <td style={{ padding: "4px 8px" }}>
+                      <button onClick={() => {
+                        const reg = (form.vehicle_register || []).filter((_, idx) => idx !== i);
+                        setForm(f => ({ ...f, vehicle_register: reg }));
+                      }} style={{ background: "transparent", border: "none", color: "#C0392B", cursor: "pointer", fontSize: "0.85rem", fontWeight: 700 }}>✕</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr style={{ background: "#E8EDF5", fontWeight: 600 }}>
+                  <td colSpan={5} style={{ padding: "6px 8px", fontSize: "0.78rem" }}>
+                    {(form.vehicle_register || []).filter(v => v.asset_type === "hcv").length} HCV trucks · {(form.vehicle_register || []).filter(v => v.asset_type === "trailer").length} trailers
+                  </td>
+                  <td style={{ padding: "6px 8px", fontSize: "0.78rem" }}>
+                    R{(form.vehicle_register || []).reduce((s, v) => s + (v.insured_value || 0), 0).toLocaleString("en-ZA")}
+                  </td>
+                  <td colSpan={2} />
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        ) : (
+          <div style={{ padding: "12px", background: "#F5F7FA", borderRadius: "6px", fontSize: "0.82rem", color: "#5C6570", textAlign: "center" }}>
+            No vehicles yet — upload a fleet schedule or add rows manually.
+          </div>
+        )}
+        <button
+          onClick={() => {
+            const reg = [...(form.vehicle_register || []), { registration: "", make: "", model: "", year: null, insured_value: 0, cover: "comp", asset_type: "hcv" }];
+            setForm(f => ({ ...f, vehicle_register: reg }));
+          }}
+          style={{ marginTop: "8px", background: "transparent", border: "1px solid #14213D", color: "#14213D", borderRadius: "5px", padding: "5px 14px", fontSize: "0.80rem", cursor: "pointer" }}>
+          + Add vehicle
+        </button>
       </div>
 
       <button

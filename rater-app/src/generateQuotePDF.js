@@ -213,28 +213,56 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
     y = addSectionTitle(doc, y, cohortLabel);
 
     if (isHcv) {
-      // HCV-specific breakdown
-      const mfrLoad = cohort.hcv_manufacturer_loading;
-      const ageLoad = cohort.hcv_age_loading;
+      // HCV summary
       const qualFactor = cohort.hcv_qualifier?.factor;
-      const totalSI = cohort.total_sum_insured || (cohort.hcv_sum_insured_per_vehicle || 0) * (cohort.vehicle_count || 0);
       y = addKeyValueTable(doc, y, [
-        ["Vehicle Count", String(cohort.vehicle_count || 0)],
-        ["Sum Insured per Vehicle", fmt(cohort.hcv_sum_insured_per_vehicle)],
-        ["Total Fleet Sum Insured", fmt(totalSI)],
-        ["Manufacturer", (cohort.hcv_manufacturer || "—").replace(/_/g, " ")],
-        ["Average Vehicle Year Model", cohort.hcv_year_model ? String(cohort.hcv_year_model) : "—"],
-        ["Age Band", cohort.hcv_age_band ? cohort.hcv_age_band.replace(/_/g, " ") : "—"],
         ["Base Rate", "4.5% p.a. of sum insured"],
-        ["Manufacturer Loading", mfrLoad != null ? (mfrLoad >= 0 ? "+" : "") + (mfrLoad * 100).toFixed(0) + "%" : "—"],
-        ["Age Band Loading", ageLoad != null ? (ageLoad >= 0 ? "+" : "") + (ageLoad * 100).toFixed(0) + "%" : "—"],
         ["Data-Source Qualifier", cohort.hcv_qualifier?.label || "—"],
         ["Qualifier Factor", qualFactor != null ? qualFactor.toFixed(2) + "×" : "—"],
         ["Loss Ratio", cohort.hcv_loss_ratio_pct != null ? cohort.hcv_loss_ratio_pct.toFixed(1) + "%" : "—"],
         ["Loss Ratio Override", cohort.hcv_loss_ratio_override_approver ? `Approved by ${cohort.hcv_loss_ratio_override_approver}` : "—"],
+        ["Total Fleet Sum Insured", fmt(cohort.total_sum_insured)],
         ["Monthly Premium", fmt(cohort.cohort_monthly)],
         ["Annual Premium", fmt(cohort.cohort_annual)],
       ]);
+      // Per-vehicle schedule table
+      if (cohort.pricing_mode === "per_vehicle" && cohort.priced_vehicles?.length > 0) {
+        if (y > 200) { doc.addPage(); y = 20; }
+        doc.setFontSize(10);
+        doc.setFont("helvetica", "bold");
+        doc.setTextColor(...NAVY);
+        doc.text("Vehicle Schedule — Individual Premium Allocation", 14, y);
+        y += 6;
+        autoTable(doc, {
+          startY: y,
+          margin: { left: 14, right: 14 },
+          head: [["Reg","Make","Model","Year","Sum Insured","Mfr Load","Age Band","Monthly","Annual"]],
+          body: cohort.priced_vehicles.map(v => [
+            v.registration || "—",
+            v.make || "—",
+            (v.model || "—").substring(0, 22),
+            v.year ? String(v.year) : "—",
+            `R${(v.insured_value || 0).toLocaleString("en-ZA")}`,
+            v.mfr_loading != null ? (v.mfr_loading >= 0 ? "+" : "") + (v.mfr_loading * 100).toFixed(0) + "%" : "—",
+            v.age_band ? v.age_band.replace(/_/g, " ") : "—",
+            fmt(v.monthly),
+            fmt(v.annual),
+          ]),
+          foot: [[
+            { content: `TOTAL — ${cohort.priced_vehicles.length} vehicles`, colSpan: 4, styles: { fontStyle: "bold" } },
+            { content: `R${(cohort.total_sum_insured || 0).toLocaleString("en-ZA")}`, styles: { fontStyle: "bold" } },
+            "", "",
+            { content: fmt(cohort.cohort_monthly) + "/mo", styles: { fontStyle: "bold" } },
+            { content: fmt(cohort.cohort_annual), styles: { fontStyle: "bold" } },
+          ]],
+          headStyles: { fillColor: NAVY, textColor: WHITE, fontSize: 7.5 },
+          footStyles: { fillColor: [232, 237, 245], textColor: NAVY, fontSize: 7.5 },
+          bodyStyles: { fontSize: 7.5 },
+          alternateRowStyles: { fillColor: [245, 247, 250] },
+          theme: "grid",
+        });
+        y = doc.lastAutoTable.finalY + 8;
+      }
     } else if (isPlantAgri) {
       // Plant/Agri breakdown
       y = addKeyValueTable(doc, y, [
@@ -249,18 +277,50 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
         ["Annual Premium", fmt(cohort.cohort_annual)],
       ]);
     } else if (isTrailer) {
-      // Trailer breakdown
+      // Trailer summary
       y = addKeyValueTable(doc, y, [
-        ["Unit Count", String(cohort.vehicle_count || 0)],
-        ["Trailer Type", (cohort.trailer_type || "tautliner").replace(/_/g, " ")],
-        ["Sum Insured per Trailer", fmt(cohort.trailer_sum_insured_per_unit)],
-        ["Total Sum Insured", fmt(cohort.trailer_total_si)],
         ["Base Rate", "2.0% p.a. of sum insured"],
         ["Own Damage Excess", "10% of claim (min R15,000)"],
         ["Theft / Hijack Excess", "15% of claim (min R7,500)"],
+        ["Total Sum Insured", fmt(cohort.trailer_total_si)],
         ["Monthly Premium", fmt(cohort.cohort_monthly)],
         ["Annual Premium", fmt(cohort.cohort_annual)],
       ]);
+      // Per-trailer schedule table
+      if (cohort.pricing_mode === "per_vehicle" && cohort.priced_trailers?.length > 0) {
+        if (y > 200) { doc.addPage(); y = 20; }
+        doc.setFontSize(10);
+        doc.setFont("helvetica", "bold");
+        doc.setTextColor(...NAVY);
+        doc.text("Trailer Schedule — Individual Premium Allocation", 14, y);
+        y += 6;
+        autoTable(doc, {
+          startY: y,
+          margin: { left: 14, right: 14 },
+          head: [["Reg Number","Make","Model","Year","Sum Insured","Monthly Prem","Annual Prem"]],
+          body: cohort.priced_trailers.map(v => [
+            v.registration || "—",
+            v.make || "—",
+            (v.model || "—").substring(0, 25),
+            v.year ? String(v.year) : "—",
+            `R${(v.insured_value || 0).toLocaleString("en-ZA")}`,
+            fmt(v.monthly),
+            fmt(v.annual),
+          ]),
+          foot: [[
+            { content: `TOTAL (${cohort.priced_trailers.length} trailers)`, colSpan: 4, styles: { fontStyle: "bold" } },
+            { content: `R${(cohort.trailer_total_si || 0).toLocaleString("en-ZA")}`, styles: { fontStyle: "bold" } },
+            { content: fmt(cohort.cohort_monthly) + "/mo", styles: { fontStyle: "bold" } },
+            { content: fmt(cohort.cohort_annual), styles: { fontStyle: "bold" } },
+          ]],
+          headStyles: { fillColor: NAVY, textColor: WHITE, fontSize: 8 },
+          footStyles: { fillColor: [232, 237, 245], textColor: NAVY, fontSize: 8 },
+          bodyStyles: { fontSize: 8 },
+          alternateRowStyles: { fillColor: [245, 247, 250] },
+          theme: "grid",
+        });
+        y = doc.lastAutoTable.finalY + 8;
+      }
     } else {
       // GIT breakdown
       y = addKeyValueTable(doc, y, [
