@@ -1545,7 +1545,7 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
   "avg_km_per_vehicle_month": number or null,
   "cargo_type": one of ["agricultural_produce","chemicals_hazmat_adr","chemicals_non_hazmat","electronics_high_value","fmcg_food_bev","fuel_petroleum","general_merchandise","livestock","minerals_mining","refrigerated","retail_clothing","steel_metals"] or null,
   "operating_corridor": one of ["cross_border_sadc","kwazulu_natal_regional","mixed_sa_national","n1_cape_johannesburg","n1_north_limpopo_zimbabwe_border","n12_east_rand_port_elizabeth","n14_n4_botswana_border","n3_johannesburg_durban","northern_cape_manganese_routes","western_cape_regional"] or null,
-  "night_ops_pct": number (0-100) or null,
+  "night_ops_pct": number (0-100) or null. If document says YES to night driving between 22:00-05:00 with no percentage given, set to 35. If NO, set to 0,
   "anti_theft_devices": one of ["none","tracking_only","tracking_immobiliser"] or null,
   "load_limit_per_vehicle": number or null,
   "commodity_type": one of ["agricultural_grain","alcohol_beverages","ammunition_explosives_fireworks","antiques_artworks","automotive_parts","bloodstock_game","building_materials","bullion_cash_treasury_notes","cameras_cellphones_accessories","coal_mining_bulk","cobalt","computers_memory_systems","copper_any_form","documents_specie_stamps_tickets","electronics_tech","fmcg_branded_high_risk","fmcg_retail_general","fuel_petroleum","general_cargo","gold_silver_jewellery_watches_furs","machinery_equipment","metals_steel_chrome","non_ferrous_metals","pharmaceuticals","prepaid_phone_cards","refrigerated_goods","timber_paper","tobacco_cigars_cigarettes"] or null,
@@ -1553,7 +1553,7 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
   "claims_history": one of ["clean","one_claim"] or null,
   "loss_ratio_pct": number or null,
   "cover_type": one of ["all_risks","fire_collision_overturning_theft_hijack","fire_collision_overturning_only"] or null,
-  "iot_devices": [string] or null,
+  "iot_devices": [string] or null,\n  "hcv_data_source": one of ["none","oem_only","oem_video"] or null,
   "is_high_value_cargo": boolean or null,
   "is_rmp1_scoped": boolean or null,
   "cargosnap_fitted": boolean or null,
@@ -1582,7 +1582,7 @@ VEHICLE REGISTER RULES:
 - make: the manufacturer name (e.g. "Scania", "Freightliner", "Mercedes-Benz").
 - model: the full model description as printed (e.g. "R420 CA 6X4 ESZ T/T C/C").
 - year: the model year as a 4-digit integer.
-- Do NOT group vehicles — one row per vehicle, always.`;
+- IoT/telematics mapping: if document mentions cameras (2x or 4x), add "dashcam_front_rear" to iot_devices. If telematics supplier named (C-Track, MiX, Cartrack, Netstar, Ctrack, Track), set hcv_data_source to "oem_only". If supplier named AND video cameras confirmed, set hcv_data_source to "oem_video". If no telematics mentioned, set hcv_data_source to "none".\n\nDo NOT group vehicles — one row per vehicle, always.`;
 
   const processDocument = useCallback(async (file) => {
     if (!file) return;
@@ -1752,7 +1752,7 @@ VEHICLE REGISTER RULES:
         if (extracted.avg_km_per_vehicle_month != null) updated.avg_km_per_vehicle_month = extracted.avg_km_per_vehicle_month;
         if (extracted.cargo_type) updated.cargo_type = extracted.cargo_type;
         if (extracted.operating_corridor) updated.operating_corridor = extracted.operating_corridor;
-        if (extracted.night_ops_pct != null) updated.night_ops_pct = extracted.night_ops_pct;
+        if (extracted.night_ops_pct != null) updated.night_ops_pct = extracted.night_ops_pct > 1 ? extracted.night_ops_pct / 100 : extracted.night_ops_pct;
         if (extracted.anti_theft_devices) updated.anti_theft_devices = extracted.anti_theft_devices;
         if (extracted.load_limit_per_vehicle != null) updated.load_limit_per_vehicle = extracted.load_limit_per_vehicle;
         if (extracted.commodity_type) updated.commodity_type = extracted.commodity_type;
@@ -1761,6 +1761,7 @@ VEHICLE REGISTER RULES:
         if (extracted.loss_ratio_pct != null) updated.loss_ratio_pct = extracted.loss_ratio_pct;
         if (extracted.cover_type) updated.cover_type = extracted.cover_type;
         if (Array.isArray(extracted.iot_devices) && extracted.iot_devices.length > 0) updated.iot_devices_fitted = extracted.iot_devices;
+        if (extracted.hcv_data_source) updated.hcv_data_source = extracted.hcv_data_source;
         if (extracted.is_high_value_cargo != null) updated.is_high_value_cargo = extracted.is_high_value_cargo;
         if (extracted.is_rmp1_scoped != null) updated.is_rmp1_scoped = extracted.is_rmp1_scoped;
         if (extracted.cargosnap_fitted != null) updated.cargosnap_fitted = extracted.cargosnap_fitted;
@@ -3707,3 +3708,9 @@ function SectionLabel({ children }) {
 
 const thStyle = { textAlign: "left", padding: "8px 10px", fontWeight: 600, color: "#14213D" };
 const tdStyle = { padding: "8px 10px" };
+
+
+
+
+
+
