@@ -102,6 +102,7 @@ const ASSET_CLASS_LABELS = {
   refrigerated_cold_chain: "Refrigerated / Cold Chain",
   abnormal_loads_oversized: "Abnormal Loads / Oversized",
   drone_commercial: "Drone / Commercial",
+  trailer: "Trailer",
 };
 
 // HCV asset classes — these get the Fleetboard data-source qualifier applied.
@@ -356,10 +357,47 @@ function priceGitCohort(cohort, sharedFields) {
   };
 }
 
+// Trailer pricing constants (market-validated from real Lombard/Renasa policies)
+const TRAILER_BASE_RATE = 0.020; // 2.0% p.a. of declared value
+const TRAILER_MIN_ANNUAL_PREMIUM = 5000;
+const TRAILER_TYPE_LABELS = {
+  tautliner: "Tautliner / Curtainsider",
+  flatdeck: "Flatdeck",
+  tanker: "Tanker (non-hazmat)",
+  side_tipper: "Side Tipper",
+  interlink: "Interlink",
+  refrigerated: "Refrigerated Trailer",
+  other: "Other / Unspecified",
+};
+
+function priceTrailerCohort(cohort) {
+  const count = cohort.vehicle_count || 0;
+  const siPerUnit = cohort.trailer_sum_insured_per_unit || 0;
+  const totalSI = siPerUnit * count;
+
+  if (totalSI <= 0 || count <= 0) {
+    return { ...cohort, status: "REFER", referral_reason: "Enter sum insured per trailer and unit count to price this cohort.", cohort_monthly: null, cohort_annual: null };
+  }
+
+  let annual = totalSI * TRAILER_BASE_RATE;
+  let minApplied = false;
+  if (annual < TRAILER_MIN_ANNUAL_PREMIUM) { annual = TRAILER_MIN_ANNUAL_PREMIUM; minApplied = true; }
+
+  return {
+    ...cohort,
+    status: "QUOTABLE",
+    trailer_total_si: totalSI,
+    cohort_monthly: Math.round(annual / 12 * 100) / 100,
+    cohort_annual: Math.round(annual * 100) / 100,
+    min_premium_applied: minApplied,
+  };
+}
+
 function priceCohort(cohort, sharedFields) {
   const cls = cohort.asset_class || "hcv_general_freight";
   if (cls === "yellow_metal_plant") return pricePlantCohort(cohort);
   if (cls === "agricultural_equipment") return priceAgriCohort(cohort);
+  if (cls === "trailer") return priceTrailerCohort(cohort);
   if (HCV_ASSET_CLASSES.has(cls)) return priceHcvCohort(cohort, sharedFields);
   return priceGitCohort(cohort, sharedFields);
 }
@@ -389,6 +427,9 @@ function makeCohort(index, shared) {
     // Agri fields
     agri_machine_type: "tractor",
     agri_data_source: "oemOnly",
+    // Trailer-specific fields
+    trailer_sum_insured_per_unit: 0,
+    trailer_type: "tautliner",
     // HCV-specific fields
     hcv_sum_insured_per_vehicle: shared?.avg_sum_insured_per_vehicle || 0,
     hcv_manufacturer: shared?.manufacturer || "mercedes_benz",
@@ -858,7 +899,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
         const isReferred = cohort.status === "REFER";
         const isPlantAgri = cohort.asset_class === "yellow_metal_plant" || cohort.asset_class === "agricultural_equipment";
         const isHcv = HCV_ASSET_CLASSES.has(cohort.asset_class);
-        const needsOverride = isReferred && !isPlantAgri && !isHcv && cohort.load_limit_per_vehicle < GIT_LOAD_LIMIT_MIN_RAND;
+        const isTrailer = cohort.asset_class === "trailer";
+        const needsOverride = isReferred && !isPlantAgri && !isHcv && !isTrailer && cohort.load_limit_per_vehicle < GIT_LOAD_LIMIT_MIN_RAND;
         const isLastCohort = idx === pricedCohorts.length - 1;
 
         return (
@@ -905,6 +947,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                     ? `R${(cohort.machine_value_per_unit || 0).toLocaleString()} /machine`
                     : isHcv
                     ? `R${(cohort.hcv_sum_insured_per_vehicle || 0).toLocaleString()} /vehicle`
+                    : isTrailer
+                    ? `R${(cohort.trailer_sum_insured_per_unit || 0).toLocaleString()} /trailer`
                     : `R${(cohort.load_limit_per_vehicle || 0).toLocaleString()} load limit`}
                 </div>
               </div>
@@ -927,6 +971,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       ? `${cohort.rating_factor?.toFixed(2)}x · ${cohort.profile}`
                       : HCV_ASSET_CLASSES.has(cohort.asset_class)
                       ? `${cohort.hcv_qualifier?.factor?.toFixed(2)}× qualifier · ${cohort.hcv_age_band?.replace(/_/g," ") || ""} age band`
+                      : isTrailer
+                      ? `2.0% p.a. · ${(cohort.trailer_type || "tautliner").replace(/_/g," ")}`
                       : `${cohort.multiplier?.toFixed(2)}x · R${cohort.final_pvpm?.toFixed(2)}/veh`}
                   </div>
                 )}
@@ -982,7 +1028,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       style={inputStyle}
                     />
                   </div>
-                  {!isPlantAgri && !isHcv && (
+                  {!isPlantAgri && !isHcv && !isTrailer && (
                     <div>
                       <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Load limit per vehicle (R)</div>
                       <input
@@ -998,7 +1044,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                       />
                     </div>
                   )}
-                  {isHcv && (
+                  {isHcv && !isTrailer && (
                     <div>
                       <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Sum insured per vehicle (R)</div>
                       <input
@@ -1107,8 +1153,45 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                 </div>
                 )}
 
+                {/* Trailer-specific fields */}
+                {isTrailer && (
+                <div style={{ marginTop: "14px", padding: "12px 14px", background: "#F1ECE0", borderRadius: "6px", borderLeft: "3px solid #14213D" }}>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#14213D", marginBottom: "10px" }}>Trailer Underwriting</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Sum insured per trailer (R)</div>
+                      <input type="number" min="0" step="10000"
+                        value={cohort.trailer_sum_insured_per_unit === 0 ? "" : cohort.trailer_sum_insured_per_unit}
+                        placeholder="0"
+                        onFocus={(e) => setTimeout(() => e.target.select(), 0)}
+                        onChange={(e) => updateCohort(cohort.id, "trailer_sum_insured_per_unit", e.target.value === "" ? 0 : Math.max(0, parseInt(e.target.value, 10)) || 0)}
+                        onWheel={(e) => e.target.blur()}
+                        style={inputStyle} />
+                      {cohort.trailer_sum_insured_per_unit > 5000000 && (
+                        <div style={{ fontSize: "0.72rem", color: "#B5762A", marginTop: "3px" }}>⚠ Sum insured per trailer exceeds R5m — verify.</div>
+                      )}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "0.72rem", color: "#5C6570", marginBottom: "4px" }}>Trailer type</div>
+                      <select value={cohort.trailer_type || "tautliner"} onChange={(e) => updateCohort(cohort.id, "trailer_type", e.target.value)} style={inputStyle}>
+                        <option value="tautliner">Tautliner / Curtainsider</option>
+                        <option value="flatdeck">Flatdeck</option>
+                        <option value="tanker">Tanker (non-hazmat)</option>
+                        <option value="side_tipper">Side Tipper</option>
+                        <option value="interlink">Interlink</option>
+                        <option value="refrigerated">Refrigerated Trailer</option>
+                        <option value="other">Other / Unspecified</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: "0.74rem", color: "#5C6570", marginTop: "8px" }}>
+                    Base rate: 2.0% p.a. · Own damage excess: 10% min R15,000 · Theft/hijack: 15% min R7,500
+                  </div>
+                </div>
+                )}
+
                 {/* ORCA Underwriting Panel — GIT only */}
-                {!isHcv && cohort.asset_class !== "yellow_metal_plant" && cohort.asset_class !== "agricultural_equipment" && (
+                {!isHcv && !isTrailer && cohort.asset_class !== "yellow_metal_plant" && cohort.asset_class !== "agricultural_equipment" && (
                 <div
                   style={{
                     marginTop: "14px",
@@ -1288,7 +1371,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                 )}
 
                 {/* Below-R50k override — GIT only */}
-                {!isHcv && needsOverride && (
+                {!isHcv && !isTrailer && needsOverride && (
                   <div
                     style={{
                       marginTop: "14px",
@@ -1372,6 +1455,18 @@ export default function MultiCohortView({ sharedFleetInfo }) {
                           )}
                         </div>
                         <div>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                      </>
+                    ) : isTrailer ? (
+                      <>
+                        <div>Total sum insured: R{cohort.trailer_total_si?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                        <div>Trailer type: {TRAILER_TYPE_LABELS[cohort.trailer_type] || "Tautliner"}</div>
+                        <div>Base rate: {(TRAILER_BASE_RATE * 100).toFixed(1)}% p.a. of sum insured</div>
+                        <div>Own damage excess: 10% min R15,000</div>
+                        <div>Theft / hijack excess: 15% min R7,500</div>
+                        <div style={{ marginTop: "6px", borderTop: "1px dashed #D4C4B0", paddingTop: "6px" }}>
+                          <strong>Annual: R{cohort.cohort_annual?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · Monthly: R{cohort.cohort_monthly?.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo</strong>
+                          {cohort.min_premium_applied && <span style={{ color: "#B5762A", marginLeft: "8px" }}>(min R5,000/yr applied)</span>}
+                        </div>
                       </>
                     ) : isHcv ? (
                       <>

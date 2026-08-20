@@ -208,6 +208,7 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
 
     const isHcv = HCV_ASSET_CLASSES.has(cohort.asset_class);
     const isPlantAgri = PLANT_AGRI_CLASSES.has(cohort.asset_class);
+    const isTrailer = cohort.asset_class === "trailer";
     const cohortLabel = `Cohort ${idx + 1}: ${(cohort.asset_class || "").replace(/_/g, " ")} — ${(cohort.commodity_type || "").replace(/_/g, " ")}`;
     y = addSectionTitle(doc, y, cohortLabel);
 
@@ -244,6 +245,19 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
         ["Base Rate", cohort.asset_class === "yellow_metal_plant" ? "2.0% p.a." : "1.6% p.a."],
         ["Rating Factor", cohort.rating_factor != null ? cohort.rating_factor.toFixed(2) + "×" : "—"],
         ["Profile", cohort.profile || "—"],
+        ["Monthly Premium", fmt(cohort.cohort_monthly)],
+        ["Annual Premium", fmt(cohort.cohort_annual)],
+      ]);
+    } else if (isTrailer) {
+      // Trailer breakdown
+      y = addKeyValueTable(doc, y, [
+        ["Unit Count", String(cohort.vehicle_count || 0)],
+        ["Trailer Type", (cohort.trailer_type || "tautliner").replace(/_/g, " ")],
+        ["Sum Insured per Trailer", fmt(cohort.trailer_sum_insured_per_unit)],
+        ["Total Sum Insured", fmt(cohort.trailer_total_si)],
+        ["Base Rate", "2.0% p.a. of sum insured"],
+        ["Own Damage Excess", "10% of claim (min R15,000)"],
+        ["Theft / Hijack Excess", "15% of claim (min R7,500)"],
         ["Monthly Premium", fmt(cohort.cohort_monthly)],
         ["Annual Premium", fmt(cohort.cohort_annual)],
       ]);
