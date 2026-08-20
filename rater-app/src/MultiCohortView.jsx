@@ -605,7 +605,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
   const [cohorts, setCohorts] = useState(() => [makeCohort(0, shared)]);
 
   // Reset cohorts when fleet_name changes — auto-create trailer cohort from vehicle register
-  const prevFleetNameRef = useRef(shared?.fleet_name);
+  const prevFleetNameRef = useRef(null);
   React.useEffect(() => {
     const newName = shared?.fleet_name;
     if (newName && newName !== prevFleetNameRef.current) {
@@ -1866,3 +1866,5 @@ export default function MultiCohortView({ sharedFleetInfo }) {
     </div>
   );
 }
+
+
