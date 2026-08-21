@@ -192,6 +192,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo) {
     const minApplied = totalAnnual < HCV_MIN_ANNUAL_PREMIUM;
     const finalAnnual = minApplied ? HCV_MIN_ANNUAL_PREMIUM : totalAnnual;
 
+    const baseAnnual = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0) * HCV_BASE_RATE, 0);
     return {
       ...cohort,
       status: "QUOTABLE",
@@ -203,6 +204,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo) {
       cohort_annual: Math.round(finalAnnual * 100) / 100,
       min_premium_applied: minApplied,
       pricing_mode: "per_vehicle",
+      multiplier: baseAnnual > 0 ? Math.round((totalAnnual / baseAnnual) * 100) / 100 : qual.factor,
     };
   }
 
@@ -974,7 +976,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
             className="tx-btn"
             onClick={() => {
               import("./generateQuotePDF.js").then((mod) => {
-                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, { ...sharedFields, fleet_name: shared.fleet_name, iot_devices: sharedFields.iot_devices_fitted, night_ops_pct: shared.night_ops_pct || 0 });
+                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, { ...sharedFields, fleet_name: shared.fleet_name, iot_devices: sharedFields.iot_devices_fitted, night_ops_pct: shared.night_ops_pct || 0, year_model: shared.year_model || null });
               });
             }}
             style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
