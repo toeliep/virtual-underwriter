@@ -798,7 +798,14 @@ export default function MultiCohortView({ sharedFleetInfo }) {
       if (underwriting.exclusionCheck.status === "absolute_exclusion") {
         status = "REFER";
         referral_reason = `Commodity '${c.commodity_type}' is an ORCA absolute exclusion — not coverable under any circumstance`;
-      } else if (underwriting.trackingStatus.required && !underwriting.trackingStatus.met) {
+      } else if (
+        underwriting.trackingStatus.required &&
+        !underwriting.trackingStatus.met &&
+        !HCV_ASSET_CLASSES.has(c.asset_class) &&
+        c.asset_class !== "trailer"
+      ) {
+        // Tracking REFER gate applies to GIT cohorts only — HCV and Trailer
+        // have their own qualifier/underwriting rules and are not hard-referred for missing vendor
         status = "REFER";
         referral_reason = `Tracking requirement not met: ${underwriting.trackingStatus.reason}`;
       }
