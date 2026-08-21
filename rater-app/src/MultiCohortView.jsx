@@ -512,7 +512,7 @@ function makeCohort(index, shared) {
     hcv_sum_insured_per_vehicle: shared?.avg_sum_insured_per_vehicle || 0,
     hcv_manufacturer: shared?.manufacturer || "mercedes_benz",
     hcv_year_model: shared?.year_model || new Date().getFullYear(),
-    hcv_data_source: "oem_only",
+    hcv_data_source: shared?.hcv_data_source || "oem_only",
     hcv_loss_ratio_pct: null,
     hcv_loss_ratio_override_approver: "",
     hcv_loss_ratio_override_reason: "",
@@ -965,7 +965,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
             className="tx-btn"
             onClick={() => {
               import("./generateQuotePDF.js").then((mod) => {
-                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, { ...sharedFields, fleet_name: shared.fleet_name, iot_devices: sharedFields.iot_devices_fitted });
+                mod.generateMultiCohortQuotePDF(pricedCohorts, fleetSummary, { ...sharedFields, fleet_name: shared.fleet_name, iot_devices: sharedFields.iot_devices_fitted, night_ops_pct: shared.night_ops_pct || 0 });
               });
             }}
             style={{ background: "#14213D", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "6px", fontSize: "0.88rem", cursor: "pointer", fontWeight: 600 }}
@@ -1866,5 +1866,6 @@ export default function MultiCohortView({ sharedFleetInfo }) {
     </div>
   );
 }
+
 
 

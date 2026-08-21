@@ -196,7 +196,7 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
       ["Geographic Zone", (sharedLoadings.geographic_zone || "—").replace(/_/g, " ")],
       ["Claims History", (sharedLoadings.claims_history || "—").replace(/_/g, " ")],
       ["Fleet Age", (sharedLoadings.fleet_age || "—").replace(/_/g, " ")],
-      ["Night Operations", (sharedLoadings.night_ops || "—").replace(/_/g, " ")],
+      ["Night Operations", sharedLoadings.night_ops_pct > 0.30 ? "over 30pct" : "under 30pct"],
       ["Cross-Border", (sharedLoadings.cross_border || "—").replace(/_/g, " ")],
       ["Cover Type", (sharedLoadings.cover_type || "—").replace(/_/g, " ")],
       ["IoT Devices", (sharedLoadings.iot_devices_fitted || sharedLoadings.iot_devices || []).map((d) => d.replace(/_/g, " ")).join(", ") || "—"],
