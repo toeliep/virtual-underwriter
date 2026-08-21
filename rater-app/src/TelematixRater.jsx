@@ -1761,7 +1761,7 @@ VEHICLE REGISTER RULES:
         if (extracted.loss_ratio_pct != null) updated.loss_ratio_pct = extracted.loss_ratio_pct;
         if (extracted.cover_type) updated.cover_type = extracted.cover_type;
         if (Array.isArray(extracted.iot_devices) && extracted.iot_devices.length > 0) updated.iot_devices_fitted = extracted.iot_devices;
-        if (extracted.hcv_data_source) updated.hcv_data_source = extracted.hcv_data_source;
+        if (extracted.hcv_data_source && extracted.hcv_data_source !== "none") { if (!updated.hcv_data_source || updated.hcv_data_source === "none") updated.hcv_data_source = extracted.hcv_data_source; }
         if (extracted.is_high_value_cargo != null) updated.is_high_value_cargo = extracted.is_high_value_cargo;
         if (extracted.is_rmp1_scoped != null) updated.is_rmp1_scoped = extracted.is_rmp1_scoped;
         if (extracted.cargosnap_fitted != null) updated.cargosnap_fitted = extracted.cargosnap_fitted;
@@ -3708,6 +3708,8 @@ function SectionLabel({ children }) {
 
 const thStyle = { textAlign: "left", padding: "8px 10px", fontWeight: 600, color: "#14213D" };
 const tdStyle = { padding: "8px 10px" };
+
+
 
 
 
