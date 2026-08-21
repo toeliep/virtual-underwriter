@@ -1572,6 +1572,19 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
   "extraction_notes": string
 }\`;
 
+AFRIKAANS COLUMN HEADER MAPPINGS (common in SA fleet schedules):
+- JAAR = year model
+- MAAK = make / manufacturer
+- MODEL = model description
+- REG NO or REGISTRASIE = registration number
+- AGREED VALUE or WAARDE = insured / agreed value
+- VIN NO = chassis number (ignore for register)
+- VRAGMOTORS or TREKKERS = HCV truck section (asset_type: hcv)
+- TRAILERS or SLEEPERS = trailer section (asset_type: trailer)
+- ITEM = row number (ignore)
+When a spreadsheet has separate sections for trucks and trailers (e.g. VRAGMOTORS / TRAILERS), extract ALL vehicles from ALL sections into vehicle_register. Use the section header to set asset_type.
+
+AFRIKAANS COLUMN HEADERS: JAAR=year, MAAK=make, MODEL=model, REG NO=registration, AGREED VALUE or WAARDE=insured value. Section headers: VRAGMOTORS or TREKKERS=HCV trucks (asset_type: hcv), TRAILERS=trailers (asset_type: trailer). Extract ALL vehicles from ALL sections.
 VEHICLE REGISTER RULES:
 - Always populate vehicle_register from any vehicle schedule in the document.
 - List EVERY vehicle and trailer individually — one object per line item.
@@ -1601,6 +1614,7 @@ VEHICLE REGISTER RULES:
 
     // Pre-computed JS figures (Excel only — remain 0 for PDF path)
     let jsVehicleCount = 0;
+        let jsVehicleRegisterOuter = [];
     let jsTotalSumInsured = 0;
 
     try {
@@ -1614,15 +1628,35 @@ VEHICLE REGISTER RULES:
 
         // Pre-compute vehicle count and sum insured in JavaScript (do NOT trust AI arithmetic)
         let jsComputedNote = "";
+        const jsVehicleRegister = [];
         workbook.SheetNames.forEach((sheetName) => {
           const sheet = workbook.Sheets[sheetName];
           const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
           if (rows.length < 2) return;
+          let currentAssetType = "hcv";
+          rows.forEach((row) => {
+            const first = String(row[0] || "").toUpperCase().trim();
+            if (first.includes("VRAGMOTOR") || first.includes("TREKKER")) { currentAssetType = "hcv"; return; }
+            if (first.includes("TRAILER") || first.includes("SLEEPER")) { currentAssetType = "trailer"; return; }
+            const allCols = row.map(c => String(c || "").toUpperCase());
+            const isHeader = allCols.some(c => c === "JAAR" || c === "MAAK" || c === "REG NO" || c === "ITEM");
+            if (isHeader) return;
+            const jaar = row[1]; const maak = String(row[2] || "").trim(); const model = String(row[3] || "").trim();
+            const regIdx = row.findIndex(c => /^[A-Z]{2,3}\d{3,6}[A-Z]{0,3}$/.test(String(c || "").trim()));
+            const reg = regIdx >= 0 ? String(row[regIdx] || "").trim() : "unknown";
+            const lastVal = [...row].reverse().find(c => { const n = parseFloat(String(c || "").replace(/[^0-9.]/g, "")); return !isNaN(n) && n > 10000; });
+            const waarde = lastVal ? parseFloat(String(lastVal).replace(/[^0-9.]/g, "")) : 0;
+            if (maak && maak !== "MAAK" && maak !== "" && !isNaN(waarde) && waarde > 0) {
+              jsVehicleRegister.push({ registration: reg, make: maak, model: model, year: Number(jaar) || 0, insured_value: waarde, cover: "comp", asset_type: currentAssetType });
+            }
+              jsVehicleRegisterOuter.push({ registration: reg, make: maak, model: model, year: Number(jaar) || 0, insured_value: waarde, cover: "comp", asset_type: currentAssetType });
+          });
           // Find header row — look for a row containing "SUM INSURED" or "INSURED" or "VALUE"
-          const headerIdx = rows.findIndex(r => r.some(c => String(c).toUpperCase().includes("INSURED") || String(c).toUpperCase().includes("VALUE")));
+          const headerIdx = rows.findIndex(r => r.some(c => String(c).toUpperCase().includes("INSURED") || String(c).toUpperCase().includes("VALUE") || String(c).toUpperCase().includes("WAARDE") || String(c).toUpperCase().includes("AGREED")));
           if (headerIdx < 0) return;
           const headers = rows[headerIdx].map(c => String(c).toUpperCase());
-          const siCol = headers.findIndex(h => h.includes("SUM INSURED") || h.includes("INSURED VALUE") || (h.includes("INSURED") && !h.includes("RETAIL")));
+          const siCol = headers.findIndex(h => h.includes("SUM INSURED") || h.includes("INSURED VALUE") || h.includes("AGREED VALUE") || h.includes("WAARDE") || (h.includes("INSURED") && !h.includes("RETAIL")));
+
           if (siCol < 0) return;
           for (let i = headerIdx + 1; i < rows.length; i++) {
             const row = rows[i];
@@ -1707,11 +1741,11 @@ VEHICLE REGISTER RULES:
       // Map extracted values into form fields (only overwrite non-null extractions)
       setForm((prev) => {
         const updated = { ...prev };
-        if (extracted.vehicle_register && extracted.vehicle_register.length > 0) {
-          updated.vehicle_register = extracted.vehicle_register;
-          // Auto-compute truck/trailer splits from register
-          const trucks = extracted.vehicle_register.filter(v => v.asset_type === "hcv");
-          const trailers = extracted.vehicle_register.filter(v => v.asset_type === "trailer");
+
+        const aiRegister = extracted.vehicle_register || []; const useRegister = aiRegister.length > 0 && aiRegister.some(v => v.make && v.make !== "unknown") ? aiRegister : (jsVehicleRegisterOuter.length > 0 ? jsVehicleRegisterOuter : aiRegister);
+        if (useRegister.length > 0) {
+          updated.vehicle_register = useRegister;
+          const trucks = useRegister.filter(v => v.asset_type === "hcv");
           if (trucks.length > 0) {
             updated.hcv_truck_count = trucks.length;
             updated.vehicle_count = trucks.length;
@@ -3708,6 +3742,8 @@ function SectionLabel({ children }) {
 
 const thStyle = { textAlign: "left", padding: "8px 10px", fontWeight: 600, color: "#14213D" };
 const tdStyle = { padding: "8px 10px" };
+
+
 
 
 
