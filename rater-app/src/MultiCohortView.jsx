@@ -450,6 +450,7 @@ function priceTrailerCohort(cohort, sharedFleetInfo) {
       cohort_annual: Math.round(finalAnnual * 100) / 100,
       min_premium_applied: minApplied,
       pricing_mode: "per_vehicle",
+      multiplier: 1.0,
     };
   }
 
@@ -468,6 +469,7 @@ function priceTrailerCohort(cohort, sharedFleetInfo) {
     cohort_monthly: Math.round(annual / 12 * 100) / 100,
     cohort_annual: Math.round(annual * 100) / 100,
     min_premium_applied: minApplied, pricing_mode: "cohort_level",
+    multiplier: 1.0,
   };
 }
 

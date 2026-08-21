@@ -1943,17 +1943,24 @@ VEHICLE REGISTER RULES:
     setDragOver(false);
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
-    setUploadedFileNames(files.map(f => f.name));
-    // Process files sequentially — each extraction merges into form state
+    setUploadedFileNames(prev => {
+      const existing = prev || [];
+      const newNames = files.map(f => f.name).filter(n => !existing.includes(n));
+      return [...existing, ...newNames];
+    });
     files.reduce((chain, file) => chain.then(() => processDocument(file)), Promise.resolve());
   }, [processDocument]);
 
   const handleFileSelect = useCallback((e) => {
     const files = Array.from(e.target.files);
     if (files.length === 0) return;
-    setUploadedFileNames(files.map(f => f.name));
+    setUploadedFileNames(prev => {
+      const existing = prev || [];
+      const newNames = files.map(f => f.name).filter(n => !existing.includes(n));
+      return [...existing, ...newNames];
+    });
     files.reduce((chain, file) => chain.then(() => processDocument(file)), Promise.resolve());
-    e.target.value = ""; // reset so same file can be re-selected
+    e.target.value = "";
   }, [processDocument]);
 
   return (
@@ -2000,10 +2007,12 @@ VEHICLE REGISTER RULES:
             style={{ display: "none" }}
           />
           <div style={{ fontSize: "0.88rem", color: "#14213D", fontWeight: 600 }}>
-            {extractStatus === "idle" && "Drop one or more files here, or click to upload — PDF, Excel or CSV (fleet schedule, policy, quote)"}
-            {extractStatus === "reading" && `Reading ${uploadedFileNames.length > 1 ? uploadedFileNames.length + " files" : "document"}...`}
-            {extractStatus === "extracting" && `Extracting fleet details${uploadedFileNames.length > 1 ? " (" + uploadedFileNames.length + " files)" : ""} — this takes a few seconds...`}
-            {extractStatus === "done" && `Extraction complete${uploadedFileNames.length > 1 ? " (" + uploadedFileNames.length + " files merged)" : ""} — fields populated below. Review and edit before saving.`}
+            {extractStatus === "idle" && (uploadedFileNames.length === 0
+              ? "Drop one or more files here, or click to upload — PDF, Excel or CSV (fleet schedule, policy, quote)"
+              : `${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} uploaded — drop more to add, or fill in fields below`)}
+            {extractStatus === "reading" && `Reading file ${uploadedFileNames.length > 0 ? `(${uploadedFileNames.length} total)` : ""}...`}
+            {extractStatus === "extracting" && `Extracting fleet details — ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} processed...`}
+            {extractStatus === "done" && `Extraction complete — ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} merged. Review and edit before saving.`}
             {extractStatus === "error" && "Extraction failed — fill in manually below."}
           </div>
           {uploadedFileNames.length > 0 && (

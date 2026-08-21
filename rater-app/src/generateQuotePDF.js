@@ -191,11 +191,37 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
   ]);
 
   if (sharedLoadings) {
+    // Claims history — derive from actual HCV cohort loss ratio data, not the form field
+    const hcvCohort = cohorts.find(c => HCV_ASSET_CLASSES.has(c.asset_class));
+    let claimsDisplay = (sharedLoadings.claims_history || "—").replace(/_/g, " ");
+    if (hcvCohort?.hcv_loss_ratio_pct != null) {
+      const lr = hcvCohort.hcv_loss_ratio_pct.toFixed(1);
+      if (hcvCohort.hcv_loss_ratio_override_approver) {
+        claimsDisplay = `Referred — ${lr}% LR (override: ${hcvCohort.hcv_loss_ratio_override_approver})`;
+      } else if (hcvCohort.hcv_loss_ratio_pct > 65) {
+        claimsDisplay = `Referred — ${lr}% LR`;
+      } else {
+        claimsDisplay = `${lr}% LR — within threshold`;
+      }
+    }
+
+    // Fleet age — compute from vehicle register average year model
+    let fleetAgeDisplay = (sharedLoadings.fleet_age || "—").replace(/_/g, " ");
+    const avgYear = sharedLoadings.year_model;
+    if (avgYear && avgYear > 1990) {
+      const age = new Date().getFullYear() - avgYear;
+      if (age <= 3) fleetAgeDisplay = `New (avg ${avgYear}, ≤3 years)`;
+      else if (age <= 5) fleetAgeDisplay = `3–5 years (avg ${avgYear})`;
+      else if (age <= 8) fleetAgeDisplay = `6–8 years (avg ${avgYear})`;
+      else if (age <= 11) fleetAgeDisplay = `9–11 years (avg ${avgYear})`;
+      else fleetAgeDisplay = `Over 11 years (avg ${avgYear})`;
+    }
+
     y = addSectionTitle(doc, y, "Shared Loadings (from Fleet Information)");
     y = addKeyValueTable(doc, y, [
       ["Geographic Zone", (sharedLoadings.geographic_zone || "").replace(/_/g, " ").replace(/\b\w/g, function(c){return c.toUpperCase()})],
-      ["Claims History", (sharedLoadings.claims_history || "—").replace(/_/g, " ")],
-      ["Fleet Age", (sharedLoadings.fleet_age || "—").replace(/_/g, " ")],
+      ["Claims History", claimsDisplay],
+      ["Fleet Age", fleetAgeDisplay],
       ["Night Operations", sharedLoadings.night_ops_pct > 0.30 ? "over 30pct" : "under 30pct"],
       ["Cross-Border", (sharedLoadings.cross_border || "—").replace(/_/g, " ")],
       ["Cover Type", (sharedLoadings.cover_type || "—").replace(/_/g, " ")],
