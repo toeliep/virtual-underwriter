@@ -1486,6 +1486,7 @@ function FleetInformationView({ sharedFleetInfo, onSave }) {
   const [extractNotes, setExtractNotes] = useState(null);
   const [extractKey, setExtractKey] = useState(0); // increments on each extraction to force form re-render
   const [dragOver, setDragOver] = useState(false);
+  const [uploadedFileNames, setUploadedFileNames] = useState([]);
   const fileInputRef = useRef(null);
 
   const updateField = (key, value) => {
@@ -1572,19 +1573,6 @@ Return ONLY valid JSON (no markdown fences, no prose) in this exact shape:
   "extraction_notes": string
 }\`;
 
-AFRIKAANS COLUMN HEADER MAPPINGS (common in SA fleet schedules):
-- JAAR = year model
-- MAAK = make / manufacturer
-- MODEL = model description
-- REG NO or REGISTRASIE = registration number
-- AGREED VALUE or WAARDE = insured / agreed value
-- VIN NO = chassis number (ignore for register)
-- VRAGMOTORS or TREKKERS = HCV truck section (asset_type: hcv)
-- TRAILERS or SLEEPERS = trailer section (asset_type: trailer)
-- ITEM = row number (ignore)
-When a spreadsheet has separate sections for trucks and trailers (e.g. VRAGMOTORS / TRAILERS), extract ALL vehicles from ALL sections into vehicle_register. Use the section header to set asset_type.
-
-AFRIKAANS COLUMN HEADERS: JAAR=year, MAAK=make, MODEL=model, REG NO=registration, AGREED VALUE or WAARDE=insured value. Section headers: VRAGMOTORS or TREKKERS=HCV trucks (asset_type: hcv), TRAILERS=trailers (asset_type: trailer). Extract ALL vehicles from ALL sections.
 VEHICLE REGISTER RULES:
 - Always populate vehicle_register from any vehicle schedule in the document.
 - List EVERY vehicle and trailer individually — one object per line item.
@@ -1614,7 +1602,6 @@ VEHICLE REGISTER RULES:
 
     // Pre-computed JS figures (Excel only — remain 0 for PDF path)
     let jsVehicleCount = 0;
-        let jsVehicleRegisterOuter = [];
     let jsTotalSumInsured = 0;
 
     try {
@@ -1627,48 +1614,126 @@ VEHICLE REGISTER RULES:
         const workbook = XLSX.read(arrayBuffer, { type: "array" });
 
         // Pre-compute vehicle count and sum insured in JavaScript (do NOT trust AI arithmetic)
-        let jsComputedNote = "";
-        const jsVehicleRegister = [];
-        workbook.SheetNames.forEach((sheetName) => {
-          const sheet = workbook.Sheets[sheetName];
-          const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-          if (rows.length < 2) return;
-          let currentAssetType = "hcv";
-          rows.forEach((row) => {
-            const first = String(row[0] || "").toUpperCase().trim();
-            if (first.includes("VRAGMOTOR") || first.includes("TREKKER")) { currentAssetType = "hcv"; return; }
-            if (first.includes("TRAILER") || first.includes("SLEEPER")) { currentAssetType = "trailer"; return; }
-            const allCols = row.map(c => String(c || "").toUpperCase());
-            const isHeader = allCols.some(c => c === "JAAR" || c === "MAAK" || c === "REG NO" || c === "ITEM");
-            if (isHeader) return;
-            const jaar = row[1]; const maak = String(row[2] || "").trim(); const model = String(row[3] || "").trim();
-            const regIdx = row.findIndex(c => /^[A-Z]{2,3}\d{3,6}[A-Z]{0,3}$/.test(String(c || "").trim()));
-            const reg = regIdx >= 0 ? String(row[regIdx] || "").trim() : "unknown";
-            const lastVal = [...row].reverse().find(c => { const n = parseFloat(String(c || "").replace(/[^0-9.]/g, "")); return !isNaN(n) && n > 10000; });
-            const waarde = lastVal ? parseFloat(String(lastVal).replace(/[^0-9.]/g, "")) : 0;
-            if (maak && maak !== "MAAK" && maak !== "" && !isNaN(waarde) && waarde > 0) {
-              jsVehicleRegister.push({ registration: reg, make: maak, model: model, year: Number(jaar) || 0, insured_value: waarde, cover: "comp", asset_type: currentAssetType });
-            }
-              jsVehicleRegisterOuter.push({ registration: reg, make: maak, model: model, year: Number(jaar) || 0, insured_value: waarde, cover: "comp", asset_type: currentAssetType });
-          });
-          // Find header row — look for a row containing "SUM INSURED" or "INSURED" or "VALUE"
-          const headerIdx = rows.findIndex(r => r.some(c => String(c).toUpperCase().includes("INSURED") || String(c).toUpperCase().includes("VALUE") || String(c).toUpperCase().includes("WAARDE") || String(c).toUpperCase().includes("AGREED")));
-          if (headerIdx < 0) return;
-          const headers = rows[headerIdx].map(c => String(c).toUpperCase());
-          const siCol = headers.findIndex(h => h.includes("SUM INSURED") || h.includes("INSURED VALUE") || h.includes("AGREED VALUE") || h.includes("WAARDE") || (h.includes("INSURED") && !h.includes("RETAIL")));
+        // Supports both Afrikaans-section-headed files (VRAGMOTORS / TRAILERS with JAAR/MAAK/MODEL/WAARDE)
+        // and English-column files (SUM INSURED / INSURED VALUE).
 
-          if (siCol < 0) return;
-          for (let i = headerIdx + 1; i < rows.length; i++) {
-            const row = rows[i];
-            if (!row || row.every(c => c === "" || c == null)) continue;
-            const val = parseFloat(String(row[siCol]).replace(/[^0-9.]/g, ""));
-            if (!isNaN(val) && val > 0) {
-              jsVehicleCount++;
-              jsTotalSumInsured += val;
+        // Helper: parse a numeric value from a cell (handles "R 1,234,567" formats)
+        const parseNum = (v) => {
+          const n = parseFloat(String(v == null ? "" : v).replace(/[^0-9.]/g, ""));
+          return isNaN(n) ? 0 : n;
+        };
+
+        // Helper: find the column index whose uppercased header matches any of the given substrings
+        const colIdx = (headers, ...candidates) =>
+          headers.findIndex(h => candidates.some(c => h.includes(c)));
+
+        // Helper: parse one section of rows (from after section-header row to next blank/section boundary)
+        // Returns array of { year, make, model, reg, vin, insured_value }
+        const parseSection = (rows, startIdx) => {
+          const vehicles = [];
+          // The row at startIdx is the section label (e.g. "VRAGMOTORS") — skip it
+          // Next non-empty row should be the column header row
+          let colHeaderIdx = -1;
+          for (let i = startIdx + 1; i < rows.length && i < startIdx + 5; i++) {
+            const r = rows[i];
+            const upper = r.map(c => String(c == null ? "" : c).toUpperCase().trim());
+            if (upper.some(c => c === "JAAR" || c === "MAAK" || c === "MODEL" || c === "REG NO" || c.includes("INSURED") || c === "WAARDE" || c.includes("AGREED"))) {
+              colHeaderIdx = i;
+              break;
             }
           }
-          jsComputedNote = `JS pre-computed: ${jsVehicleCount} vehicles, total sum insured R${jsTotalSumInsured.toLocaleString("en-ZA")}, avg R${Math.round(jsTotalSumInsured / jsVehicleCount).toLocaleString("en-ZA")} — use these figures, do NOT recompute.`;
+          if (colHeaderIdx < 0) return vehicles;
+
+          const hdrs = rows[colHeaderIdx].map(c => String(c == null ? "" : c).toUpperCase().trim());
+          // Map Afrikaans and English column names to indices
+          const iYear  = colIdx(hdrs, "JAAR", "YEAR", "MODEL YEAR");
+          const iMake  = colIdx(hdrs, "MAAK", "MAKE", "MANUFACTURER");
+          const iModel = colIdx(hdrs, "MODEL");
+          const iReg   = colIdx(hdrs, "REG NO", "REGISTRATION", "REG");
+          const iVin   = colIdx(hdrs, "VIN NO", "VIN", "CHASSIS");
+          // Value column: prefer "AGREED VALUE" over bare "WAARDE" or "VALUE"
+          let iVal = colIdx(hdrs, "AGREED VALUE");
+          if (iVal < 0) iVal = colIdx(hdrs, "WAARDE", "SUM INSURED", "INSURED VALUE");
+          if (iVal < 0) iVal = colIdx(hdrs, "VALUE");
+
+          for (let i = colHeaderIdx + 1; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row || row.every(c => c === "" || c == null)) break; // blank row = end of section
+            // Stop if we hit another section header
+            const firstCell = String(row[0] == null ? "" : row[0]).toUpperCase().trim();
+            if (firstCell.startsWith("VRAGMOTORS") || firstCell.startsWith("TRAILERS") || firstCell.startsWith("SEMI-TRAILERS")) break;
+            if (iVal < 0) continue;
+            const val = parseNum(row[iVal]);
+            if (val <= 0) continue;
+            // Skip totals/summary rows — they have a value but no make and no registration
+            const rowMake = iMake >= 0 ? String(row[iMake] == null ? "" : row[iMake]).trim() : "";
+            const rowReg  = iReg  >= 0 ? String(row[iReg]  == null ? "" : row[iReg]).trim()  : "";
+            if (!rowMake && !rowReg) continue;
+            vehicles.push({
+              year:          iYear  >= 0 ? parseInt(String(row[iYear]),  10) || null : null,
+              make:          iMake  >= 0 ? String(row[iMake]  == null ? "" : row[iMake]).trim()  : "",
+              model:         iModel >= 0 ? String(row[iModel] == null ? "" : row[iModel]).trim() : "",
+              reg:           iReg   >= 0 ? String(row[iReg]   == null ? "" : row[iReg]).trim()   : "unknown",
+              vin:           iVin   >= 0 ? String(row[iVin]   == null ? "" : row[iVin]).trim()   : "",
+              insured_value: val,
+            });
+          }
+          return vehicles;
+        };
+
+        // Main parse loop — try Afrikaans section detection first, fall back to English
+        let jsTrucks   = [];
+        let jsTrailers = [];
+        let jsFallbackRows = []; // used when no section headers found
+
+        workbook.SheetNames.forEach((sheetName) => {
+          const sheet = workbook.Sheets[sheetName];
+          const rows  = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+          if (rows.length < 2) return;
+
+          // Scan for Afrikaans section headers (VRAGMOTORS = trucks, TRAILERS = trailers)
+          // Use startsWith to handle variants like "VRAGMOTORS : " or "TRAILERS :"
+          let foundSections = false;
+          for (let i = 0; i < rows.length; i++) {
+            const firstCell = String(rows[i][0] == null ? "" : rows[i][0]).toUpperCase().trim();
+            if (firstCell.startsWith("VRAGMOTORS")) {
+              jsTrucks   = jsTrucks.concat(parseSection(rows, i));
+              foundSections = true;
+            } else if (firstCell.startsWith("TRAILERS") || firstCell.startsWith("SEMI-TRAILERS")) {
+              jsTrailers = jsTrailers.concat(parseSection(rows, i));
+              foundSections = true;
+            }
+          }
+
+          if (!foundSections) {
+            // English-column fallback: find the first row with INSURED/VALUE header
+            const headerIdx = rows.findIndex(r =>
+              r.some(c => String(c).toUpperCase().includes("INSURED") || String(c).toUpperCase().includes("VALUE"))
+            );
+            if (headerIdx < 0) return;
+            const hdrs  = rows[headerIdx].map(c => String(c == null ? "" : c).toUpperCase().trim());
+            let iVal = colIdx(hdrs, "SUM INSURED", "INSURED VALUE", "AGREED VALUE");
+            if (iVal < 0) iVal = colIdx(hdrs, "INSURED");
+            if (iVal < 0) return;
+            for (let i = headerIdx + 1; i < rows.length; i++) {
+              const row = rows[i];
+              if (!row || row.every(c => c === "" || c == null)) continue;
+              const val = parseNum(row[iVal]);
+              if (val > 0) jsFallbackRows.push({ insured_value: val });
+            }
+          }
         });
+
+        // Determine final counts
+        if (jsTrucks.length > 0 || jsTrailers.length > 0) {
+          // Afrikaans-section path: trucks only feed vehicle_count (trailers rated separately)
+          jsVehicleCount   = jsTrucks.length;
+          jsTotalSumInsured = jsTrucks.reduce((s, v) => s + v.insured_value, 0);
+        } else if (jsFallbackRows.length > 0) {
+          // English-column fallback: treat all as vehicles
+          jsVehicleCount   = jsFallbackRows.length;
+          jsTotalSumInsured = jsFallbackRows.reduce((s, v) => s + v.insured_value, 0);
+        }
 
         const csvSheets = workbook.SheetNames.map((sheetName) => {
           const sheet = workbook.Sheets[sheetName];
@@ -1730,8 +1795,53 @@ VEHICLE REGISTER RULES:
 
       const extracted = JSON.parse(rawText);
 
-      // Inject JS pre-computed figures if AI returned null (Excel path only — jsVehicleCount=0 for PDF)
-      if (jsVehicleCount > 0) {
+      // Inject JS pre-computed figures (Excel path only — jsVehicleCount=0 for PDF)
+      // When Afrikaans sections were parsed (jsTrucks/jsTrailers populated), JS data is authoritative
+      // for vehicle_register, vehicle_count, and sum-insured — overwrite AI output unconditionally.
+      const mfrMap = { scania: "scania", "mercedes-benz": "mercedes_benz", mercedesbenz: "mercedes_benz",
+        freightliner: "freightliner", volvo: "volvo", man: "man", daf: "daf", faw: "faw",
+        hino: "hino", isuzu: "isuzu", international: "other", western_star: "western_star" };
+
+      if (jsTrucks.length > 0 || jsTrailers.length > 0) {
+        // Build vehicle_register from JS-parsed rows (authoritative for Afrikaans schedule)
+        const truckRegister = jsTrucks.map(v => ({
+          registration:  v.reg   || "unknown",
+          make:          v.make  || "",
+          model:         v.model || "",
+          year:          v.year  || null,
+          insured_value: v.insured_value,
+          cover_type:    "comprehensive",
+          asset_type:    "hcv",
+        }));
+        const trailerRegister = jsTrailers.map(v => ({
+          registration:  v.reg   || "unknown",
+          make:          v.make  || "",
+          model:         v.model || "",
+          year:          v.year  || null,
+          insured_value: v.insured_value,
+          cover_type:    "comprehensive",
+          asset_type:    "trailer",
+        }));
+        extracted.vehicle_register = [...truckRegister, ...trailerRegister];
+        // Authoritative counts and values from JS parse
+        extracted.hcv_truck_count  = jsTrucks.length;
+        extracted.trailer_count    = jsTrailers.length;
+        extracted.vehicle_count    = jsTrucks.length;
+        const truckSI = jsTrucks.reduce((s, v) => s + v.insured_value, 0);
+        const trailerSI = jsTrailers.reduce((s, v) => s + v.insured_value, 0);
+        extracted.hcv_truck_avg_sum_insured = jsTrucks.length  > 0 ? Math.round(truckSI   / jsTrucks.length)   : null;
+        extracted.trailer_avg_sum_insured   = jsTrailers.length > 0 ? Math.round(trailerSI / jsTrailers.length) : null;
+        extracted.avg_sum_insured_per_vehicle = extracted.hcv_truck_avg_sum_insured;
+        // Dominant manufacturer from trucks
+        const makes = jsTrucks.map(v => v.make?.toLowerCase().trim()).filter(Boolean);
+        const mc = {}; makes.forEach(m => { mc[m] = (mc[m] || 0) + 1; });
+        const dom = Object.entries(mc).sort((a, b) => b[1] - a[1])[0]?.[0];
+        if (dom) extracted.manufacturer = mfrMap[dom] || "other";
+        // Average year model from trucks
+        const years = jsTrucks.map(v => v.year).filter(y => y > 1980 && y <= 2030);
+        if (years.length > 0) extracted.year_model = Math.round(years.reduce((s, y) => s + y, 0) / years.length);
+      } else if (jsVehicleCount > 0) {
+        // English-column fallback: inject totals only if AI missed them
         if (extracted.vehicle_count == null || extracted.vehicle_count === 0) extracted.vehicle_count = jsVehicleCount;
         if (extracted.avg_sum_insured_per_vehicle == null || extracted.avg_sum_insured_per_vehicle === 0) {
           extracted.avg_sum_insured_per_vehicle = Math.round(jsTotalSumInsured / jsVehicleCount);
@@ -1741,11 +1851,11 @@ VEHICLE REGISTER RULES:
       // Map extracted values into form fields (only overwrite non-null extractions)
       setForm((prev) => {
         const updated = { ...prev };
-
-        const aiRegister = extracted.vehicle_register || []; const useRegister = aiRegister.length > 0 && aiRegister.some(v => v.make && v.make !== "unknown") ? aiRegister : (jsVehicleRegisterOuter.length > 0 ? jsVehicleRegisterOuter : aiRegister);
-        if (useRegister.length > 0) {
-          updated.vehicle_register = useRegister;
-          const trucks = useRegister.filter(v => v.asset_type === "hcv");
+        if (extracted.vehicle_register && extracted.vehicle_register.length > 0) {
+          updated.vehicle_register = extracted.vehicle_register;
+          // Auto-compute truck/trailer splits from register
+          const trucks = extracted.vehicle_register.filter(v => v.asset_type === "hcv");
+          const trailers = extracted.vehicle_register.filter(v => v.asset_type === "trailer");
           if (trucks.length > 0) {
             updated.hcv_truck_count = trucks.length;
             updated.vehicle_count = trucks.length;
@@ -1816,13 +1926,19 @@ VEHICLE REGISTER RULES:
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) processDocument(file);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    setUploadedFileNames(files.map(f => f.name));
+    // Process files sequentially — each extraction merges into form state
+    files.reduce((chain, file) => chain.then(() => processDocument(file)), Promise.resolve());
   }, [processDocument]);
 
   const handleFileSelect = useCallback((e) => {
-    const file = e.target.files[0];
-    if (file) processDocument(file);
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    setUploadedFileNames(files.map(f => f.name));
+    files.reduce((chain, file) => chain.then(() => processDocument(file)), Promise.resolve());
+    e.target.value = ""; // reset so same file can be re-selected
   }, [processDocument]);
 
   return (
@@ -1864,16 +1980,26 @@ VEHICLE REGISTER RULES:
             ref={fileInputRef}
             type="file"
             accept=".pdf,.xlsx,.xls,.csv"
+            multiple
             onChange={handleFileSelect}
             style={{ display: "none" }}
           />
           <div style={{ fontSize: "0.88rem", color: "#14213D", fontWeight: 600 }}>
-            {extractStatus === "idle" && "Drop a PDF or Excel file here, or click to upload — policy schedule, fleet listing, quote, or broker submission"}
-            {extractStatus === "reading" && "Reading document..."}
-            {extractStatus === "extracting" && "Extracting fleet details — this takes a few seconds..."}
-            {extractStatus === "done" && "Extraction complete — fields populated below. Review and edit before saving."}
+            {extractStatus === "idle" && "Drop one or more files here, or click to upload — PDF, Excel or CSV (fleet schedule, policy, quote)"}
+            {extractStatus === "reading" && `Reading ${uploadedFileNames.length > 1 ? uploadedFileNames.length + " files" : "document"}...`}
+            {extractStatus === "extracting" && `Extracting fleet details${uploadedFileNames.length > 1 ? " (" + uploadedFileNames.length + " files)" : ""} — this takes a few seconds...`}
+            {extractStatus === "done" && `Extraction complete${uploadedFileNames.length > 1 ? " (" + uploadedFileNames.length + " files merged)" : ""} — fields populated below. Review and edit before saving.`}
             {extractStatus === "error" && "Extraction failed — fill in manually below."}
           </div>
+          {uploadedFileNames.length > 0 && (
+            <div style={{ fontSize: "0.75rem", color: "#666", marginTop: "6px" }}>
+              {uploadedFileNames.map((n, i) => (
+                <span key={i} style={{ display: "inline-block", background: "#f0f0f0", borderRadius: "3px", padding: "1px 6px", margin: "2px 3px 2px 0" }}>
+                  {n}
+                </span>
+              ))}
+            </div>
+          )}
           {extractStatus === "done" && (
             <div style={{ fontSize: "0.78rem", color: "#3D6B4F", marginTop: "6px" }}>
               Fields have been auto-filled from your document. Check each value below — the AI extracts, you confirm.
@@ -3742,8 +3868,6 @@ function SectionLabel({ children }) {
 
 const thStyle = { textAlign: "left", padding: "8px 10px", fontWeight: 600, color: "#14213D" };
 const tdStyle = { padding: "8px 10px" };
-
-
 
 
 
