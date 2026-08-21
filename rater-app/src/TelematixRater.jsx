@@ -1603,6 +1603,9 @@ VEHICLE REGISTER RULES:
     // Pre-computed JS figures (Excel only — remain 0 for PDF path)
     let jsVehicleCount = 0;
     let jsTotalSumInsured = 0;
+    let jsTrucks   = [];
+    let jsTrailers = [];
+    let jsFallbackRows = [];
 
     try {
       let requestBody;
@@ -1682,10 +1685,6 @@ VEHICLE REGISTER RULES:
         };
 
         // Main parse loop — try Afrikaans section detection first, fall back to English
-        let jsTrucks   = [];
-        let jsTrailers = [];
-        let jsFallbackRows = []; // used when no section headers found
-
         workbook.SheetNames.forEach((sheetName) => {
           const sheet = workbook.Sheets[sheetName];
           const rows  = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
@@ -1735,9 +1734,19 @@ VEHICLE REGISTER RULES:
           jsTotalSumInsured = jsFallbackRows.reduce((s, v) => s + v.insured_value, 0);
         }
 
+        // Build CSV for AI — when JS has already parsed trucks/trailers authoritatively,
+        // only send the first ~30 rows (enough for fleet name, cargo, corridor, zone).
+        // Sending all 100+ rows hits the token limit and truncates the JSON response.
+        const jsAlreadyParsed = jsTrucks.length > 0 || jsTrailers.length > 0;
         const csvSheets = workbook.SheetNames.map((sheetName) => {
           const sheet = workbook.Sheets[sheetName];
-          const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+          const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+          const rowsToSend = jsAlreadyParsed ? rows.slice(0, 30) : rows;
+          // Convert trimmed rows back to CSV
+          const csv = rowsToSend.map(r => r.map(c => {
+            const s = String(c == null ? "" : c);
+            return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
+          }).join(",")).join("\n");
           return `Sheet: ${sheetName}\n${csv}`;
         }).join("\n\n");
 
@@ -1748,7 +1757,7 @@ VEHICLE REGISTER RULES:
 
         requestBody = JSON.stringify({
           model: "claude-sonnet-4-6",
-          max_tokens: 4000,
+          max_tokens: 8000,
           system: "You are a data extraction assistant. You MUST respond with valid JSON only. No preamble, no explanation, no markdown fences. Your entire response must be a single valid JSON object.",
           messages: [
             {
