@@ -1861,10 +1861,16 @@ VEHICLE REGISTER RULES:
       setForm((prev) => {
         const updated = { ...prev };
         if (extracted.vehicle_register && extracted.vehicle_register.length > 0) {
-          updated.vehicle_register = extracted.vehicle_register;
+          // Only replace vehicle_register if the new one is larger — prevents a PDF's shorter
+          // conveyance list from overwriting an Excel's full truck+trailer register
+          const existingReg = prev.vehicle_register || [];
+          if (extracted.vehicle_register.length >= existingReg.length) {
+            updated.vehicle_register = extracted.vehicle_register;
+          }
+          const regToUse = updated.vehicle_register;
           // Auto-compute truck/trailer splits from register
-          const trucks = extracted.vehicle_register.filter(v => v.asset_type === "hcv");
-          const trailers = extracted.vehicle_register.filter(v => v.asset_type === "trailer");
+          const trucks = regToUse.filter(v => v.asset_type === "hcv");
+          const trailers = regToUse.filter(v => v.asset_type === "trailer");
           if (trucks.length > 0) {
             updated.hcv_truck_count = trucks.length;
             updated.vehicle_count = trucks.length;
