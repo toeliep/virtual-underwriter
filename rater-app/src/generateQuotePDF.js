@@ -193,7 +193,7 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
   if (sharedLoadings) {
     y = addSectionTitle(doc, y, "Shared Loadings (from Fleet Information)");
     y = addKeyValueTable(doc, y, [
-      ["Geographic Zone", (sharedLoadings.geographic_zone || "—").replace(/_/g, " ")],
+      ["Geographic Zone", (sharedLoadings.geographic_zone || "").replace(/_/g, " ").replace(/\b\w/g, function(c){return c.toUpperCase()})],
       ["Claims History", (sharedLoadings.claims_history || "—").replace(/_/g, " ")],
       ["Fleet Age", (sharedLoadings.fleet_age || "—").replace(/_/g, " ")],
       ["Night Operations", sharedLoadings.night_ops_pct > 0.30 ? "over 30pct" : "under 30pct"],
