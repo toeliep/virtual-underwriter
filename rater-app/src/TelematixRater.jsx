@@ -2893,11 +2893,229 @@ function RiskScoringView({ sharedFleetInfo, onProceedToPricing }) {
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// DOCUMENT TRAY — persistent intake layer shared across all 3 stages.
+// Accepts PDF / Excel / CSV; user tags each file so the rater knows what it is.
+// Provenance tag feeds into the audit trail that Santam requires.
+// ──────────────────────────────────────────────────────────────────────────────
+function DocumentTray({ documents, onAdd, onRemove, onTagChange }) {
+  const [open, setOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const trayRef = useRef(null);
+
+  const DOC_TAGS = [
+    { value: "untagged",          label: "— Tag document type —" },
+    { value: "fleet_schedule",    label: "🚛  Fleet Schedule / Vehicle Register" },
+    { value: "claims_history",    label: "📋  Claims History / Loss Run" },
+    { value: "policy_schedule",   label: "📄  Policy Schedule" },
+    { value: "needs_analysis",    label: "🔍  Needs Analysis" },
+    { value: "hcv_questionnaire", label: "📝  TelematiX HCV Questionnaire" },
+    { value: "git_questionnaire", label: "📦  TelematiX GIT Questionnaire" },
+    { value: "telematics_report", label: "📡  Telematics Platform Report" },
+    { value: "rms_icab_report",   label: "🛡  RMS / iCab Risk Assessment" },
+    { value: "forte_report",      label: "⚡  Forte FLOW Aggregated Report" },
+    { value: "other",             label: "📎  Other document" },
+  ];
+
+  const TAG_COLORS = {
+    fleet_schedule:    "#1C7293",
+    claims_history:    "#7C3AED",
+    policy_schedule:   "#14213D",
+    needs_analysis:    "#065A82",
+    hcv_questionnaire: "#0D72C8",
+    git_questionnaire: "#D97706",
+    telematics_report: "#1E9E5E",
+    rms_icab_report:   "#C0392B",
+    forte_report:      "#B5762A",
+    other:             "#5C6570",
+    untagged:          "#9CA3AF",
+  };
+
+  const handleFiles = (files) => {
+    const extOk = /\.(pdf|csv|xlsx|xls|html)$/i;
+    Array.from(files).forEach((file) => {
+      if (extOk.test(file.name)) {
+        onAdd({ id: Date.now() + Math.random(), name: file.name, size: file.size, tag: "untagged" });
+      }
+    });
+    setOpen(true);
+  };
+
+  const fmtSize = (b) =>
+    b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(0) + " KB" : (b / 1048576).toFixed(1) + " MB";
+
+  const untaggedCount = documents.filter((d) => d.tag === "untagged").length;
+  const chipBg = documents.length === 0 ? "#9CA3AF" : untaggedCount > 0 ? "#D97706" : "#1E9E5E";
+
+  return (
+    <div style={{ marginBottom: "20px" }}>
+      {/* Toggle chip */}
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: open ? "12px" : "0" }}>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          style={{
+            display: "flex", alignItems: "center", gap: "7px",
+            background: open ? "#14213D" : "#E8EDF5",
+            color: open ? "#FAF7F0" : "#14213D",
+            border: `1px solid ${open ? "#14213D" : "#C8D0DC"}`,
+            borderRadius: "20px", padding: "6px 14px",
+            fontSize: "0.82rem", fontWeight: 600, cursor: "pointer",
+            fontFamily: "'Inter', sans-serif", transition: "all 0.15s",
+          }}
+        >
+          <span>📁</span>
+          <span>Document Tray</span>
+          {documents.length > 0 && (
+            <span style={{ background: chipBg, color: "#fff", borderRadius: "10px", padding: "1px 7px", fontSize: "0.72rem", fontWeight: 700 }}>
+              {documents.length}
+            </span>
+          )}
+          {untaggedCount > 0 && (
+            <span style={{ color: "#D97706", fontSize: "0.74rem" }}>⚠ {untaggedCount} untagged</span>
+          )}
+          <span style={{ fontSize: "0.68rem", opacity: 0.55 }}>{open ? "▲" : "▼"}</span>
+        </button>
+
+        {/* Collapsed summary pills */}
+        {!open && documents.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
+            {documents.map((doc) => (
+              <span key={doc.id} style={{
+                background: TAG_COLORS[doc.tag] + "18",
+                color: TAG_COLORS[doc.tag],
+                border: `1px solid ${TAG_COLORS[doc.tag]}40`,
+                borderRadius: "4px", padding: "2px 8px",
+                fontSize: "0.71rem", fontWeight: 600,
+              }}>
+                {DOC_TAGS.find((t) => t.value === doc.tag)?.label.replace(/^[^ ]+ +/, "") || "Untagged"}
+                &nbsp;·&nbsp;{doc.name.length > 20 ? doc.name.slice(0, 18) + "…" : doc.name}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {open && (
+        <div style={{ border: "1.5px solid #C8D0DC", borderRadius: "8px", background: "#FFFEF9", overflow: "hidden" }}>
+          {/* Info bar */}
+          <div style={{ background: "#F3F1EB", borderBottom: "1px solid #C8D0DC", padding: "8px 16px", fontSize: "0.76rem", color: "#5C6570", lineHeight: 1.55 }}>
+            Drop or upload: <strong>fleet schedule, claims history, TelematiX questionnaire (HCV or GIT), telematics report, policy schedule</strong> — PDF, Excel or CSV.
+            Tag each file so the rater knows what it is and can weight the data provenance correctly.
+          </div>
+
+          {/* Drop zone */}
+          <div
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files); }}
+            onClick={() => trayRef.current?.click()}
+            style={{
+              margin: "14px 16px",
+              border: `2px dashed ${dragOver ? "#14213D" : "#C8D0DC"}`,
+              borderRadius: "6px", padding: "18px 24px",
+              textAlign: "center", cursor: "pointer",
+              background: dragOver ? "#EBE8DF" : "transparent",
+              transition: "all 0.15s",
+            }}
+          >
+            <div style={{ fontSize: "1.5rem", marginBottom: "4px" }}>📂</div>
+            <div style={{ fontSize: "0.86rem", fontWeight: 600, color: "#14213D" }}>
+              Drop one or more files here, or click to upload
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "#5C6570", marginTop: "3px" }}>
+              PDF, Excel or CSV (fleet schedule, policy, questionnaire, telematics report)
+            </div>
+          </div>
+          <input
+            ref={trayRef}
+            type="file"
+            multiple
+            accept=".pdf,.xlsx,.xls,.csv,.html"
+            style={{ display: "none" }}
+            onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
+          />
+
+          {/* File list */}
+          {documents.length > 0 && (
+            <div style={{ padding: "0 16px 16px" }}>
+              <div style={{ fontSize: "0.71rem", fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "#9CA3AF", marginBottom: "8px" }}>
+                Uploaded documents ({documents.length})
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                {documents.map((doc) => (
+                  <div key={doc.id} style={{
+                    display: "flex", alignItems: "center", gap: "10px",
+                    background: "#F3F1EB", borderRadius: "6px", padding: "8px 10px",
+                    border: `1px solid ${doc.tag !== "untagged" ? TAG_COLORS[doc.tag] + "40" : "#E5E1D8"}`,
+                    flexWrap: "wrap",
+                  }}>
+                    <span style={{ fontSize: "1.1rem", flexShrink: 0 }}>
+                      {/\.pdf$/i.test(doc.name) ? "📄" : /\.(xlsx|xls)$/i.test(doc.name) ? "📊" : /\.csv$/i.test(doc.name) ? "📋" : "📎"}
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#14213D", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {doc.name}
+                      </div>
+                      <div style={{ fontSize: "0.70rem", color: "#9CA3AF" }}>{fmtSize(doc.size)}</div>
+                    </div>
+                    <select
+                      value={doc.tag}
+                      onChange={(e) => onTagChange(doc.id, e.target.value)}
+                      style={{
+                        fontSize: "0.75rem", fontFamily: "'Inter', sans-serif",
+                        border: `1px solid ${doc.tag !== "untagged" ? TAG_COLORS[doc.tag] : "#C8D0DC"}`,
+                        borderRadius: "4px", padding: "5px 7px",
+                        background: doc.tag !== "untagged" ? TAG_COLORS[doc.tag] + "12" : "#fff",
+                        color: doc.tag !== "untagged" ? TAG_COLORS[doc.tag] : "#5C6570",
+                        fontWeight: doc.tag !== "untagged" ? 600 : 400,
+                        cursor: "pointer", minWidth: "190px",
+                      }}
+                    >
+                      {DOC_TAGS.map((t) => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => onRemove(doc.id)}
+                      title="Remove"
+                      style={{
+                        background: "none", border: "none", color: "#9CA3AF",
+                        cursor: "pointer", padding: "2px 6px",
+                        fontSize: "1.1rem", lineHeight: 1, flexShrink: 0,
+                        fontFamily: "sans-serif",
+                      }}
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+
+              {/* Provenance summary */}
+              {documents.some((d) => d.tag !== "untagged") && (
+                <div style={{ marginTop: "12px", fontSize: "0.73rem", color: "#5C6570", background: "#EBE8DF", borderRadius: "5px", padding: "8px 12px", lineHeight: 1.6 }}>
+                  <strong style={{ color: "#14213D" }}>Audit trail:</strong>{" "}
+                  {documents.filter((d) => d.tag !== "untagged").map((d) =>
+                    `${DOC_TAGS.find((t) => t.value === d.tag)?.label.replace(/^[^ ]+ +/, "") || d.tag} (${d.name})`
+                  ).join(" · ")}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function TelematixRater() {
   const [status, setStatus] = useState("idle"); // idle | reading | extracting | done | error
   const [mode, setMode] = useState("fleet_info"); // hcv | hcv_rating | git | fleet_info | multi_cohort | risk_scoring
   const [riskScoreResult, setRiskScoreResult] = useState(null);
   const [sharedFleetInfo, setSharedFleetInfo] = useState(null);
+  // Document tray — persists across all stages
+  const [docTrayItems, setDocTrayItems] = useState([]);
+  const addDocTrayItem    = (item)          => setDocTrayItems((prev) => [...prev, item]);
+  const removeDocTrayItem = (id)            => setDocTrayItems((prev) => prev.filter((d) => d.id !== id));
+  const tagDocTrayItem    = (id, tag)       => setDocTrayItems((prev) => prev.map((d) => d.id === id ? { ...d, tag } : d));
   const [fileName, setFileName] = useState(null);
   const [extracted, setExtracted] = useState(null);
   const [result, setResult] = useState(null);
@@ -3035,6 +3253,14 @@ export default function TelematixRater() {
             One pipeline: Intake → Risk Scoring → Pricing, branching by asset class. Capture fleet details once in Fleet Information to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
           </p>
         </div>
+
+        {/* ── DOCUMENT TRAY — shared across all stages ── */}
+        <DocumentTray
+          documents={docTrayItems}
+          onAdd={addDocTrayItem}
+          onRemove={removeDocTrayItem}
+          onTagChange={tagDocTrayItem}
+        />
 
         {/* ── 3-Stage pipeline progress bar ── */}
         <div style={{ display: "flex", alignItems: "center", marginBottom: "20px", borderRadius: "6px", overflow: "hidden", border: "1px solid #C8D0DC" }}>
