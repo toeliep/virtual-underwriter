@@ -220,6 +220,7 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
     y = addSectionTitle(doc, y, "Shared Loadings (from Fleet Information)");
     y = addKeyValueTable(doc, y, [
       ["Geographic Zone", (sharedLoadings.geographic_zone || "").replace(/_/g, " ").replace(/\b\w/g, function(c){return c.toUpperCase()})],
+      ["Operating Corridor", (sharedLoadings.operating_corridor || "mixed_sa_national").replace(/_/g, " ")],
       ["Claims History", claimsDisplay],
       ["Fleet Age", fleetAgeDisplay],
       ["Night Operations", sharedLoadings.night_ops_pct > 0.30 ? "over 30pct" : "under 30pct"],
@@ -385,6 +386,42 @@ export function generateMultiCohortQuotePDF(cohorts, fleetSummary, sharedLoading
     ["Penalty Excess", "5% of claim (max R10,000) — night driving 23h00-04h00, driver <25yrs or licensed <3yrs, capsizing while tipping"],
     ["Tracking Requirement", "Approved Cat A or C device required for vehicles >= R200,000"],
     ["Settlement Basis", "First-loss basis, no average clause"],
+  ]);
+
+  // Mandatory conditions — profile-dependent, must be in place before cover incepting
+  if (y > 240) { doc.addPage(); y = 20; }
+  y = addSectionTitle(doc, y, "Mandatory Conditions (before cover incepting)");
+  const profileStr = (quotableCohorts[0]?.profile || "").toLowerCase();
+  const isProfileA = profileStr.includes("profile a") || profileStr.includes("a");
+  const conditions = [
+    "Valid telematics device fitted and active — Category A or C approved vendor only",
+    "Monthly telematics data sharing with ORCA Fathom underwriter",
+    "Annual static questionnaire renewal — submitted within 30 days of policy anniversary",
+    "Driver training programme in place — documented and verifiable on request",
+    "Fatigue and hours-of-service policy — written, communicated to all drivers",
+  ];
+  if (!isProfileA) {
+    conditions.push("Dashcam installation — front-facing minimum, driver-facing recommended");
+    conditions.push("Speed limiter verification certificate — submitted within 60 days of inception");
+    conditions.push("HoS compliance plan — submitted within 30 days of inception");
+  }
+  doc.setFontSize(9);
+  doc.setTextColor(...GREY);
+  conditions.forEach(c => {
+    if (y > 270) { doc.addPage(); y = 20; }
+    doc.text(`• ${c}`, 16, y);
+    y += 5;
+  });
+  y += 4;
+
+  // Policy wording reference
+  if (y > 270) { doc.addPage(); y = 20; }
+  y = addSectionTitle(doc, y, "Policy Wording Reference");
+  y = addKeyValueTable(doc, y, [
+    ["HCV Motor", "ORCA Fathom HCV Motor Policy Wording — HCV-MW-001 (current version)"],
+    ["GIT Cargo", "ORCA Fathom GIT Cargo Policy Wording — GIT-MW-001 (current version)"],
+    ["Broker confirmation", "Broker confirms client has received, read and acknowledged applicable wording before binding"],
+    ["Underwriting pathway", quotableCohorts.length > 0 ? "Auto-issued — no underwriter referral required" : "Referred — ORCA Fathom underwriter to contact broker within 2 business days"],
   ]);
 
   addFooter(doc);

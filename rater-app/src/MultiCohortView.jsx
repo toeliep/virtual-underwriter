@@ -121,6 +121,21 @@ const HCV_QUALIFIER = {
   oem_only:  { factor: 1.40, coverage: 0.612, label: "Fleetboard / OEM only — 61.2% coverage, Profile B cap (1.40×)", color: "#B5762A" },
   oem_video: { factor: 0.70, coverage: 0.962, label: "Fleetboard + video — 96.2% coverage, Profile A eligible (0.70×)", color: "#2E6B3E" },
 };
+
+// HCV Corridor loadings — additive on base premium (Frans-confirmed)
+const HCV_CORRIDOR_LOADINGS = {
+  mixed_sa_national:               0.00,
+  n1_cape_johannesburg:            0.12,
+  n3_johannesburg_durban:          0.18,
+  n12_east_rand_port_elizabeth:    0.15,
+  n14_n4_botswana_border:          0.20,
+  n1_north_limpopo_zimbabwe_border: 0.22,
+  western_cape_regional:           0.08,
+  kwazulu_natal_regional:          0.10,
+  northern_cape_manganese_routes:  0.35,
+  cross_border_sadc:               0.30,
+};
+const HCV_CORRIDOR_LOADING_DEFAULT = 0.10;
 // HCV pricing constants (mirrored from TelematixRater.jsx scoring engine)
 const HCV_MANUFACTURER_LOADINGS = {
   mercedes_benz: 0.00, volvo: -0.03, freightliner: -0.10,
@@ -216,6 +231,10 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
     };
   }
 
+  // Corridor loading — from sharedInfo (set in Fleet Details)
+  const corridor = sharedInfo?.operating_corridor || sharedFleetInfo?.operating_corridor || "mixed_sa_national";
+  const corridorLoad = HCV_CORRIDOR_LOADINGS[corridor] ?? HCV_CORRIDOR_LOADING_DEFAULT;
+
   // Check if we have a vehicle register for per-vehicle pricing
   const register = (sharedFleetInfo?.vehicle_register || sharedInfo?.vehicle_register || []);
   const hcvVehicles = register.filter(v => v.asset_type === "hcv" && (v.insured_value || 0) > 0);
@@ -224,7 +243,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
     // PER-VEHICLE PRICING
     const pricedVehicles = hcvVehicles.map(v => priceVehicle(v, qual.factor));
     const baseAnnual = pricedVehicles.reduce((s, v) => s + v.annual, 0);
-    const totalAnnual = baseAnnual * (1 + claimsLoad);
+    const totalAnnual = baseAnnual * (1 + corridorLoad) * (1 + claimsLoad);
     const totalSI = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0), 0);
     const minApplied = totalAnnual < HCV_MIN_ANNUAL_PREMIUM;
     const finalAnnual = minApplied ? HCV_MIN_ANNUAL_PREMIUM : totalAnnual;
@@ -235,6 +254,8 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
       status: "QUOTABLE",
       hcv_qualifier: qual,
       hcv_claims_loading: claimsLoad,
+      hcv_corridor_loading: corridorLoad,
+      hcv_corridor: corridor,
       total_sum_insured: totalSI,
       vehicle_count: hcvVehicles.length,
       priced_vehicles: pricedVehicles,
@@ -260,7 +281,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
   const ageBand = classifyHcvAgeBandMC(cohort.hcv_year_model);
   const ageLoad = HCV_AGE_BAND_LOADINGS[ageBand] ?? 0;
 
-  let annual = sumInsured * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qual.factor * (1 + claimsLoad);
+  let annual = sumInsured * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qual.factor * (1 + corridorLoad) * (1 + claimsLoad);
   let minApplied = false;
   if (annual < HCV_MIN_ANNUAL_PREMIUM) { annual = HCV_MIN_ANNUAL_PREMIUM; minApplied = true; }
 
@@ -269,6 +290,8 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
     status: "QUOTABLE",
     hcv_qualifier: qual,
     hcv_claims_loading: claimsLoad,
+    hcv_corridor_loading: corridorLoad,
+    hcv_corridor: corridor,
     hcv_age_band: ageBand,
     hcv_manufacturer_loading: mfrLoad,
     hcv_age_loading: ageLoad,
@@ -1664,6 +1687,11 @@ export default function MultiCohortView({ sharedFleetInfo, claimsExtractionData,
                     ) : isHcv ? (
                       <>
                         <div>Base rate: {(HCV_BASE_RATE * 100).toFixed(1)}% p.a. · Data-source qualifier: {cohort.hcv_qualifier?.factor?.toFixed(2)}× ({cohort.hcv_qualifier?.label})</div>
+                        {cohort.hcv_corridor_loading > 0 && (
+                          <div style={{ color: "#14213D", marginTop: "2px" }}>
+                            Corridor loading: +{(cohort.hcv_corridor_loading * 100).toFixed(0)}% ({(cohort.hcv_corridor || "mixed_sa_national").replace(/_/g, " ")})
+                          </div>
+                        )}
                         {cohort.hcv_claims_loading > 0 && (
                           <div style={{ color: "#B5762A", marginTop: "2px" }}>
                             Claims experience loading: +{(cohort.hcv_claims_loading * 100).toFixed(0)}% (LR {cohort.hcv_loss_ratio_pct?.toFixed(1)}%)
