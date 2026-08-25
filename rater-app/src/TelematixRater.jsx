@@ -973,7 +973,7 @@ function HcvRatingView({ sharedFleetInfo }) {
           letterSpacing: "0.08em",
         }}
       >
-        HCV Rating
+        HCV Motor Rate
       </div>
 
       <div style={{ marginBottom: "20px" }}>
@@ -1478,7 +1478,7 @@ function makeFleetInfoDefaults() {
   };
 }
 
-function FleetInformationView({ sharedFleetInfo, onSave }) {
+function FleetInformationView({ sharedFleetInfo, onSave, onProceed, pendingExtractionFile, onExtractionConsumed }) {
   const [form, setForm] = useState({ ...makeFleetInfoDefaults(), ...(sharedFleetInfo || {}) });
   const [saved, setSaved] = useState(false);
   const [extractStatus, setExtractStatus] = useState("idle"); // idle | reading | extracting | done | error
@@ -1938,6 +1938,20 @@ VEHICLE REGISTER RULES:
     }
   }, []);
 
+  // Auto-trigger extraction when a file is pushed from the Document Tray
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  React.useEffect(() => {
+    if (pendingExtractionFile) {
+      setUploadedFileNames(prev => {
+        const existing = prev || [];
+        return existing.includes(pendingExtractionFile.name) ? existing : [...existing, pendingExtractionFile.name];
+      });
+      processDocument(pendingExtractionFile).then(() => {
+        if (onExtractionConsumed) onExtractionConsumed();
+      });
+    }
+  }, [pendingExtractionFile]); // eslint-disable-line
+
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     setDragOver(false);
@@ -1975,69 +1989,39 @@ VEHICLE REGISTER RULES:
           letterSpacing: "0.08em",
         }}
       >
-        Fleet Information
+        Fleet Details
       </div>
       <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "20px", lineHeight: 1.5 }}>
-        Capture fleet details here once — they carry through to Risk Scoring and Multi-Cohort automatically. Fill in as much as you have; fields can be adjusted at each step.
+        Capture fleet details here once — they carry through to Risk Scoring (Telematics + SQ) and Fleet Pricing Summary automatically. Fill in as much as you have; fields can be adjusted at each step.
       </div>
 
-      {/* Document upload zone */}
-      <div style={{ marginBottom: "24px" }}>
-        <div
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={handleDrop}
-          onClick={() => fileInputRef.current?.click()}
-          style={{
-            border: `2px dashed ${dragOver ? "#B5762A" : "#CCC"}`,
-            borderRadius: "8px",
-            padding: "20px",
-            textAlign: "center",
-            cursor: "pointer",
-            background: dragOver ? "rgba(181,118,42,0.05)" : "transparent",
-            transition: "all 0.2s",
-          }}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".pdf,.xlsx,.xls,.csv"
-            multiple
-            onChange={handleFileSelect}
-            style={{ display: "none" }}
-          />
-          <div style={{ fontSize: "0.88rem", color: "#14213D", fontWeight: 600 }}>
-            {extractStatus === "idle" && (uploadedFileNames.length === 0
-              ? "Drop one or more files here, or click to upload — PDF, Excel or CSV (fleet schedule, policy, quote)"
-              : `${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} uploaded — drop more to add, or fill in fields below`)}
-            {extractStatus === "reading" && `Reading file ${uploadedFileNames.length > 0 ? `(${uploadedFileNames.length} total)` : ""}...`}
-            {extractStatus === "extracting" && `Extracting fleet details — ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} processed...`}
-            {extractStatus === "done" && `Extraction complete — ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} merged. Review and edit before saving.`}
-            {extractStatus === "error" && "Extraction failed — fill in manually below."}
+      {/* Extraction status banner — shown when extraction is running or complete */}
+      {extractStatus !== "idle" && (
+        <div style={{
+          marginBottom: "20px",
+          borderRadius: "6px",
+          padding: "12px 16px",
+          fontSize: "0.83rem",
+          fontWeight: 500,
+          background: extractStatus === "done" ? "#EBF5EE" : extractStatus === "error" ? "#FDECEA" : "#EBE8DF",
+          border: `1px solid ${extractStatus === "done" ? "#1E9E5E40" : extractStatus === "error" ? "#B23A2E40" : "#C8D0DC"}`,
+          color: extractStatus === "done" ? "#1E6B45" : extractStatus === "error" ? "#B23A2E" : "#14213D",
+          display: "flex", alignItems: "center", gap: "10px",
+        }}>
+          <span style={{ fontSize: "1.1rem" }}>
+            {extractStatus === "reading" ? "⏳" : extractStatus === "extracting" ? "🔍" : extractStatus === "done" ? "✅" : "⚠️"}
+          </span>
+          <div>
+            {extractStatus === "reading" && `Reading ${uploadedFileNames[uploadedFileNames.length - 1] || "file"}…`}
+            {extractStatus === "extracting" && `Extracting fleet details from ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""}…`}
+            {extractStatus === "done" && `Extraction complete — ${uploadedFileNames.length} file${uploadedFileNames.length > 1 ? "s" : ""} merged. Review and edit the fields below before saving.`}
+            {extractStatus === "error" && (extractError || "Extraction failed — please fill in the fields manually.")}
+            {extractStatus === "done" && extractNotes && (
+              <div style={{ fontSize: "0.76rem", marginTop: "4px", opacity: 0.75 }}>Notes: {extractNotes}</div>
+            )}
           </div>
-          {uploadedFileNames.length > 0 && (
-            <div style={{ fontSize: "0.75rem", color: "#666", marginTop: "6px" }}>
-              {uploadedFileNames.map((n, i) => (
-                <span key={i} style={{ display: "inline-block", background: "#f0f0f0", borderRadius: "3px", padding: "1px 6px", margin: "2px 3px 2px 0" }}>
-                  {n}
-                </span>
-              ))}
-            </div>
-          )}
-          {extractStatus === "done" && (
-            <div style={{ fontSize: "0.78rem", color: "#3D6B4F", marginTop: "6px" }}>
-              Fields have been auto-filled from your document. Check each value below — the AI extracts, you confirm.
-            </div>
-          )}
-          {extractError && (
-            <div style={{ fontSize: "0.78rem", color: "#B23A2E", marginTop: "6px" }}>{extractError}</div>
-          )}
-          {extractNotes && (
-            <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "6px" }}>Notes: {extractNotes}</div>
-          )}
-
         </div>
-      </div>
+      )}
 
       {/* Shared section — key forces re-render after extraction populates form state */}
       <div key={`form-${extractKey}`} style={{ marginBottom: "20px" }}>
@@ -2071,7 +2055,7 @@ VEHICLE REGISTER RULES:
       {/* HCV block */}
       <div style={{ border: "1.5px solid #14213D", borderRadius: "8px", padding: "18px", marginBottom: "20px" }}>
         <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.72rem", color: "#14213D", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "14px" }}>
-          HCV Rating inputs
+          HCV Motor Rate inputs
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px" }}>
           <FormField label="Asset class">
@@ -2206,17 +2190,17 @@ VEHICLE REGISTER RULES:
             </FormField>
             {form.hcv_data_source === "none" && (
               <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "4px", lineHeight: 1.5 }}>
-                No telematics — fleet capped at Profile B. Mandatory conditions: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right. Factor: 1.40× applied in Multi-Cohort pricing.
+                No telematics — fleet capped at Profile B. Mandatory conditions: HoS plan, cellphone warranty, speed limiter verification, 30-day cancellation right. Factor: 1.40× applied in Fleet Pricing Summary pricing.
               </div>
             )}
             {form.hcv_data_source === "oem_only" && (
               <div style={{ fontSize: "0.78rem", color: "#B5762A", marginTop: "4px", lineHeight: 1.5 }}>
-                OEM telematics — cellphone usage (15% weight) and safety-belt compliance (10% weight) are data gaps; no camera to see them. Fleet capped at Profile B. Add a driver-facing camera to reach Profile A. Factor: 1.40× applied in Multi-Cohort pricing.
+                OEM telematics — cellphone usage (15% weight) and safety-belt compliance (10% weight) are data gaps; no camera to see them. Fleet capped at Profile B. Add a driver-facing camera to reach Profile A. Factor: 1.40× applied in Fleet Pricing Summary pricing.
               </div>
             )}
             {form.hcv_data_source === "oem_video" && (
               <div style={{ fontSize: "0.78rem", color: "#2E6B3E", marginTop: "4px", lineHeight: 1.5 }}>
-                Full coverage — 96.2% data visibility across all 10 telematics metrics. Profile A eligible. Factor: 0.70× applied in Multi-Cohort pricing.
+                Full coverage — 96.2% data visibility across all 10 telematics metrics. Profile A eligible. Factor: 0.70× applied in Fleet Pricing Summary pricing.
               </div>
             )}
           </div>
@@ -2226,7 +2210,7 @@ VEHICLE REGISTER RULES:
       {/* GIT block */}
       <div style={{ border: "1.5px solid #14213D", borderRadius: "8px", padding: "18px", marginBottom: "24px" }}>
         <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "0.72rem", color: "#14213D", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "14px" }}>
-          GIT Quoting inputs
+          GIT Cargo Quote inputs
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginBottom: "16px" }}>
           <FormField label="Load limit per vehicle (R)">
@@ -2366,7 +2350,7 @@ VEHICLE REGISTER RULES:
           Static Risk Questionnaire (optional — 7 items)
         </div>
         <div style={{ fontSize: "0.78rem", color: "#5C6570", marginBottom: "14px" }}>
-          Each item scores 0 / 35 / 70 / 100. Leave "Not scored" to skip — skipped items are excluded from the composite. Scores feed Risk Scoring automatically when you save.
+          Each item scores 0 / 35 / 70 / 100. Leave "Not scored" to skip — skipped items are excluded from the composite. Scores feed Risk Scoring (Telematics + SQ) automatically when you save.
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px" }}>
           <FormField label="Driving hour policy">
@@ -2439,7 +2423,7 @@ VEHICLE REGISTER RULES:
       <div style={{ marginBottom: "20px" }}>
         <SectionLabel>Vehicle Register</SectionLabel>
         <div style={{ fontSize: "0.78rem", color: "#5C6570", marginBottom: "10px" }}>
-          Auto-populated from document upload. Add, edit, or remove rows. Each vehicle is priced individually in Multi-Cohort.
+          Auto-populated from document upload. Add, edit, or remove rows. Each vehicle is priced individually in Fleet Pricing Summary.
         </div>
         {(form.vehicle_register || []).length > 0 ? (
           <div style={{ overflowX: "auto" }}>
@@ -2537,26 +2521,48 @@ VEHICLE REGISTER RULES:
         </button>
       </div>
 
-      <button
-        className="tx-btn"
-        onClick={handleSave}
-        style={{
-          background: "#14213D",
-          color: "#FAF7F0",
-          border: "none",
-          borderRadius: "5px",
-          padding: "10px 20px",
-          fontSize: "0.9rem",
-          fontWeight: 600,
-          cursor: "pointer",
-          fontFamily: "'Inter', sans-serif",
-        }}
-      >
-        Save fleet information
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+        <button
+          className="tx-btn"
+          onClick={handleSave}
+          style={{
+            background: saved ? "#1E9E5E" : "#14213D",
+            color: "#FAF7F0",
+            border: "none",
+            borderRadius: "5px",
+            padding: "10px 20px",
+            fontSize: "0.9rem",
+            fontWeight: 600,
+            cursor: "pointer",
+            fontFamily: "'Inter', sans-serif",
+            transition: "background 0.2s",
+          }}
+        >
+          {saved ? "✓ Fleet information saved" : "Save fleet information"}
+        </button>
+        {saved && onProceed && (
+          <button
+            className="tx-btn"
+            onClick={onProceed}
+            style={{
+              background: "#1C7293",
+              color: "#FAF7F0",
+              border: "none",
+              borderRadius: "5px",
+              padding: "10px 20px",
+              fontSize: "0.9rem",
+              fontWeight: 600,
+              cursor: "pointer",
+              fontFamily: "'Inter', sans-serif",
+            }}
+          >
+            Proceed to Risk Scoring (Telematics + SQ) →
+          </button>
+        )}
+      </div>
       {saved && (
-        <div style={{ marginTop: "12px", fontSize: "0.82rem", color: "#3D6B4F" }}>
-          Saved — fleet details and questionnaire scores carried through to Risk Scoring and Multi-Cohort.
+        <div style={{ marginTop: "8px", fontSize: "0.8rem", color: "#5C6570" }}>
+          Fleet details saved. Complete Renewal Analysis if needed, then proceed to Risk Scoring (Telematics + SQ).
         </div>
       )}
     </div>
@@ -2783,7 +2789,7 @@ function RiskScoringView({ sharedFleetInfo, onProceedToPricing }) {
   return (
     <div style={{ maxWidth: "860px", margin: "0 auto" }}>
       <div style={{ background: "#E8EDF5", borderRadius: "8px", padding: "14px 18px", marginBottom: "20px", fontSize: "0.88rem", color: "#14213D" }}>
-        <strong>Stage 2 — Risk Scoring.</strong> Enter telematics scores and static questionnaire. Click <em>Compute Risk Score</em> to see the Profile verdict. No premium is calculated here — proceed to Stage 3 for pricing.
+        <strong>Stage 2 — Risk Scoring (Telematics + SQ).</strong> Enter telematics scores and static questionnaire. Click <em>Compute Risk Score</em> to see the Profile verdict. No premium is calculated here — proceed to Stage 3 for pricing.
         {sharedFleetInfo?.fleet_name && <span style={{ marginLeft: "12px", color: "#5C6570" }}>Fleet: <strong>{sharedFleetInfo.fleet_name}</strong></span>}
       </div>
 
@@ -2898,36 +2904,34 @@ function RiskScoringView({ sharedFleetInfo, onProceedToPricing }) {
 // Accepts PDF / Excel / CSV; user tags each file so the rater knows what it is.
 // Provenance tag feeds into the audit trail that Santam requires.
 // ──────────────────────────────────────────────────────────────────────────────
-function DocumentTray({ documents, onAdd, onRemove, onTagChange }) {
+function DocumentTray({ documents, onAdd, onRemove, onTagChange, onExtract }) {
   const [open, setOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const trayRef = useRef(null);
 
   const DOC_TAGS = [
-    { value: "untagged",          label: "— Tag document type —" },
-    { value: "fleet_schedule",    label: "🚛  Fleet Schedule / Vehicle Register" },
-    { value: "claims_history",    label: "📋  Claims History / Loss Run" },
-    { value: "policy_schedule",   label: "📄  Policy Schedule" },
-    { value: "needs_analysis",    label: "🔍  Needs Analysis" },
-    { value: "hcv_questionnaire", label: "📝  TelematiX HCV Questionnaire" },
-    { value: "git_questionnaire", label: "📦  TelematiX GIT Questionnaire" },
-    { value: "telematics_report", label: "📡  Telematics Platform Report" },
-    { value: "rms_icab_report",   label: "🛡  RMS / iCab Risk Assessment" },
-    { value: "forte_report",      label: "⚡  Forte FLOW Aggregated Report" },
-    { value: "other",             label: "📎  Other document" },
+    { value: "untagged",              label: "— Tag document type —" },
+    { value: "broker_questionnaire",  label: "📋  Broker Telematics Questionnaire" },
+    { value: "fleet_schedule",        label: "🚛  Fleet Schedule / Vehicle Register" },
+    { value: "claims_history",        label: "📊  Claims History / Loss Run" },
+    { value: "policy_schedule",       label: "📄  Policy Schedule" },
+    { value: "needs_analysis",        label: "🔍  Needs Analysis" },
+    { value: "telematics_report",     label: "📡  Telematics Platform Report" },
+    { value: "rms_icab_report",       label: "🛡  RMS / iCab Risk Assessment" },
+    { value: "forte_report",          label: "⚡  Forte FLOW Aggregated Report" },
+    { value: "other",                 label: "📎  Other document" },
   ];
 
   const TAG_COLORS = {
-    fleet_schedule:    "#1C7293",
-    claims_history:    "#7C3AED",
-    policy_schedule:   "#14213D",
-    needs_analysis:    "#065A82",
-    hcv_questionnaire: "#0D72C8",
-    git_questionnaire: "#D97706",
-    telematics_report: "#1E9E5E",
-    rms_icab_report:   "#C0392B",
-    forte_report:      "#B5762A",
-    other:             "#5C6570",
+    broker_questionnaire: "#7C3AED",
+    fleet_schedule:       "#1C7293",
+    claims_history:       "#B45309",
+    policy_schedule:      "#14213D",
+    needs_analysis:       "#065A82",
+    telematics_report:    "#1E9E5E",
+    rms_icab_report:      "#C0392B",
+    forte_report:         "#B5762A",
+    other:                "#5C6570",
     untagged:          "#9CA3AF",
   };
 
@@ -2935,7 +2939,7 @@ function DocumentTray({ documents, onAdd, onRemove, onTagChange }) {
     const extOk = /\.(pdf|csv|xlsx|xls|html)$/i;
     Array.from(files).forEach((file) => {
       if (extOk.test(file.name)) {
-        onAdd({ id: Date.now() + Math.random(), name: file.name, size: file.size, tag: "untagged" });
+        onAdd({ id: Date.now() + Math.random(), name: file.name, size: file.size, tag: "untagged", file });
       }
     });
     setOpen(true);
@@ -3047,7 +3051,7 @@ function DocumentTray({ documents, onAdd, onRemove, onTagChange }) {
                     display: "flex", alignItems: "center", gap: "10px",
                     background: "#F3F1EB", borderRadius: "6px", padding: "8px 10px",
                     border: `1px solid ${doc.tag !== "untagged" ? TAG_COLORS[doc.tag] + "40" : "#E5E1D8"}`,
-                    flexWrap: "wrap",
+
                   }}>
                     <span style={{ fontSize: "1.1rem", flexShrink: 0 }}>
                       {/\.pdf$/i.test(doc.name) ? "📄" : /\.(xlsx|xls)$/i.test(doc.name) ? "📊" : /\.csv$/i.test(doc.name) ? "📋" : "📎"}
@@ -3075,6 +3079,19 @@ function DocumentTray({ documents, onAdd, onRemove, onTagChange }) {
                         <option key={t.value} value={t.value}>{t.label}</option>
                       ))}
                     </select>
+                    {doc.tag !== "untagged" && doc.file && onExtract && (
+                      <button
+                        onClick={() => onExtract(doc.file, doc.tag)}
+                        title="Extract data from this file into the rater"
+                        style={{
+                          background: "#1E9E5E", border: "none", color: "#fff",
+                          cursor: "pointer", padding: "5px 10px",
+                          fontSize: "0.74rem", fontWeight: 700, borderRadius: "4px",
+                          flexShrink: 0, fontFamily: "'Inter', sans-serif",
+                          whiteSpace: "nowrap",
+                        }}
+                      >Extract →</button>
+                    )}
                     <button
                       onClick={() => onRemove(doc.id)}
                       title="Remove"
@@ -3116,6 +3133,248 @@ export default function TelematixRater() {
   const addDocTrayItem    = (item)          => setDocTrayItems((prev) => [...prev, item]);
   const removeDocTrayItem = (id)            => setDocTrayItems((prev) => prev.filter((d) => d.id !== id));
   const tagDocTrayItem    = (id, tag)       => setDocTrayItems((prev) => prev.map((d) => d.id === id ? { ...d, tag } : d));
+
+  // Pending extraction file — set by Document Tray Extract button, consumed by the target view
+  const [pendingFleetFile,      setPendingFleetFile]      = useState(null);
+  const [pendingPolicyFile,     setPendingPolicyFile]     = useState(null);
+  const [pendingTelematicsFile, setPendingTelematicsFile] = useState(null);
+
+  // Questionnaire + claims extraction results injected into child views
+  const [questionnaireData,    setQuestionnaireData]    = useState(null); // parsed from broker_questionnaire PDF
+  const [claimsExtractionData, setClaimsExtractionData] = useState(null); // parsed from claims_history PDF
+  const [qExtracting,          setQExtracting]          = useState(false);
+  const [qExtractError,        setQExtractError]        = useState(null);
+  const [claimsExtracting,     setClaimsExtracting]     = useState(false);
+  const [claimsExtractError,   setClaimsExtractError]   = useState(null);
+
+  const extractDocTrayFile = (file, tag) => {
+    if (tag === "fleet_schedule") {
+      setPendingFleetFile(file);
+      setMode("fleet_info");
+    } else if (tag === "policy_schedule" || tag === "needs_analysis") {
+      setPendingPolicyFile(file);
+    } else if (tag === "telematics_report" || tag === "rms_icab_report" || tag === "forte_report") {
+      setPendingTelematicsFile(file);
+    } else if (tag === "claims_history") {
+      processClaimsHistory(file);
+    } else if (tag === "broker_questionnaire") {
+      processQuestionnaire(file);
+    }
+  };
+
+  // ── Broker Questionnaire extraction ────────────────────────────────────────
+  const QUESTIONNAIRE_EXTRACTION_PROMPT = `You are extracting data from a completed TelematiX Broker Fleet Questionnaire PDF.
+Return ONLY a single valid JSON object — no preamble, no markdown fences.
+
+Extract every field you can find. Use null for any field not present or not legible.
+
+{
+  "fleet_name": string or null,
+  "vehicle_count": number or null,
+  "manufacturer": one of ["daf","faw","freightliner","hino","isuzu","man","mercedes_benz","other","scania","ud_trucks","volvo","western_star"] or null,
+  "year_model": number (average vehicle year, 4-digit) or null,
+  "avg_sum_insured_per_vehicle": number or null,
+  "asset_class": one of ["hcv_general_freight","fuel_hazmat_tanker","minerals_bulk_long_haul","fmcg_distribution","bulk_liquids_non_hazmat","yellow_metal_plant","agricultural_equipment","refrigerated_cold_chain","abnormal_loads_oversized","drone_commercial"] or null,
+  "cargo_type": one of ["agricultural_produce","chemicals_hazmat_adr","chemicals_non_hazmat","electronics_high_value","fmcg_food_bev","fuel_petroleum","general_merchandise","livestock","minerals_mining","refrigerated","retail_clothing","steel_metals"] or null,
+  "operating_corridor": one of ["cross_border_sadc","kwazulu_natal_regional","mixed_sa_national","n1_cape_johannesburg","n1_north_limpopo_zimbabwe_border","n12_east_rand_port_elizabeth","n14_n4_botswana_border","n3_johannesburg_durban","northern_cape_manganese_routes","western_cape_regional"] or null,
+  "night_ops_pct": number (0-100) or null,
+  "anti_theft_devices": one of ["none","tracking_only","tracking_and_immobiliser"] or null,
+  "telematics_provenance": one of ["broker_declared","platform_direct","underwriter_sourced"] or null,
+  "fatigue_hos": number (0-100) or null,
+  "speeding": number (0-100) or null,
+  "cellphone_usage": number (0-100) or null,
+  "safety_belt_compliance": number (0-100) or null,
+  "driver_behaviour_composite": number (0-100) or null,
+  "distance_index": number (0-100) or null,
+  "device_integrity": number (0-100) or null,
+  "time_on_road": number (0-100) or null,
+  "night_driving_ratio": number (0-100) or null,
+  "trend_direction": one of ["improving_strongly","improving_slightly","stable","deteriorating_slightly","deteriorating_3plus_months"] or null,
+  "device_concealment_events_per_month": number or null,
+  "driving_hour_policy": one of [0,35,70,100] or null,
+  "max_speed_policy": one of [0,35,70,100] or null,
+  "telematics_use_for_driver_management": one of [0,35,70,100] or null,
+  "route_and_distance_management": one of [0,35,70,100] or null,
+  "driver_training_programme": one of [0,35,70,100] or null,
+  "driver_employment_process": one of [0,35,70,100] or null,
+  "driver_remuneration": one of [0,35,70,100] or null,
+  "loss_ratio_pct": number or null,
+  "commodity_type": one of ["agricultural_grain","alcohol_beverages","automotive_parts","building_materials","coal_mining_bulk","electronics_tech","fmcg_branded_high_risk","fmcg_retail_general","fuel_petroleum","general_cargo","machinery_equipment","metals_steel_chrome","pharmaceuticals","refrigerated_goods","timber_paper"] or null,
+  "load_limit_per_vehicle": number or null,
+  "cover_type": one of ["all_risks","fire_collision_overturning_theft_hijack","fire_collision_overturning_only"] or null,
+  "git_vehicle_count": number or null,
+  "geographic_zone": one of ["western_cape","medium_risk","gauteng_high_risk"] or null,
+  "cross_border": one of ["local","sadc"] or null,
+  "fleet_age": one of ["new","over_10yr"] or null,
+  "iot_devices": array of strings from ["gps_realtime_tracking","geofencing_alerting","driver_behaviour_monitoring","fatigue_drowsiness_sensor","cargo_seal_door_sensors","temperature_humidity_logger","load_weight_tilt_sensor","panic_button_armed_response","dashcam_front_rear"] or null,
+  "cargosnap_fitted": boolean or null,
+  "security_device": one of ["none","rmp1_top_lock","rmp2_cable_lock","rmp3_tracktag"] or null,
+  "is_high_value_cargo": boolean or null,
+  "is_rmp1_scoped": boolean or null,
+  "git_claims_history": one of ["clean","one_claim"] or null,
+  "git_loss_ratio_pct": number or null,
+  "claims_year1_gwp": number or null,
+  "claims_year1_incurred": number or null,
+  "claims_year1_lr": number or null,
+  "claims_year2_gwp": number or null,
+  "claims_year2_incurred": number or null,
+  "claims_year2_lr": number or null,
+  "claims_year3_gwp": number or null,
+  "claims_year3_incurred": number or null,
+  "claims_year3_lr": number or null,
+  "broker_name": string or null,
+  "fsp_number": string or null,
+  "extraction_notes": string
+}`;
+
+  const processQuestionnaire = useCallback(async (file) => {
+    if (!file) return;
+    setQExtracting(true);
+    setQExtractError(null);
+    try {
+      const b64 = await fileToBase64(file);
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 4000,
+          system: "You are a data extraction assistant. You MUST respond with valid JSON only. No preamble, no explanation, no markdown fences.",
+          messages: [{ role: "user", content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+            { type: "text", text: QUESTIONNAIRE_EXTRACTION_PROMPT },
+          ]}],
+        }),
+      });
+      const data = await response.json();
+      let raw = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (fenceMatch) raw = fenceMatch[1];
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("No JSON found in response");
+      const extracted = JSON.parse(jsonMatch[0]);
+      setQuestionnaireData(extracted);
+
+      // Auto-update sharedFleetInfo with questionnaire fleet fields
+      setSharedFleetInfo(prev => {
+        const base = prev || {};
+        const upd = { ...base };
+        if (extracted.fleet_name)                 upd.fleet_name = extracted.fleet_name;
+        if (extracted.vehicle_count != null)      upd.vehicle_count = extracted.vehicle_count;
+        if (extracted.manufacturer)               upd.manufacturer = extracted.manufacturer;
+        if (extracted.year_model != null)         upd.year_model = extracted.year_model;
+        if (extracted.avg_sum_insured_per_vehicle != null) upd.avg_sum_insured_per_vehicle = extracted.avg_sum_insured_per_vehicle;
+        if (extracted.asset_class)                upd.asset_class = extracted.asset_class;
+        if (extracted.cargo_type)                 upd.cargo_type = extracted.cargo_type;
+        if (extracted.operating_corridor)         upd.operating_corridor = extracted.operating_corridor;
+        if (extracted.night_ops_pct != null)      upd.night_ops_pct = extracted.night_ops_pct;
+        if (extracted.anti_theft_devices)         upd.anti_theft_devices = extracted.anti_theft_devices;
+        if (extracted.trend_direction)            upd.trend_direction = extracted.trend_direction;
+        if (extracted.device_concealment_events_per_month != null) upd.device_concealment_events_per_month = extracted.device_concealment_events_per_month;
+        if (extracted.loss_ratio_pct != null)     upd.loss_ratio_pct = extracted.loss_ratio_pct;
+        // Static SQ
+        if (extracted.driving_hour_policy != null)             upd.driving_hour_policy = extracted.driving_hour_policy;
+        if (extracted.max_speed_policy != null)                upd.max_speed_policy = extracted.max_speed_policy;
+        if (extracted.telematics_use_for_driver_management != null) upd.telematics_use_for_driver_management = extracted.telematics_use_for_driver_management;
+        if (extracted.route_and_distance_management != null)   upd.route_and_distance_management = extracted.route_and_distance_management;
+        if (extracted.driver_training_programme != null)       upd.driver_training_programme = extracted.driver_training_programme;
+        if (extracted.driver_employment_process != null)       upd.driver_employment_process = extracted.driver_employment_process;
+        if (extracted.driver_remuneration != null)             upd.driver_remuneration = extracted.driver_remuneration;
+        // Telematics scores
+        if (extracted.fatigue_hos != null)                upd.fatigue_hos = extracted.fatigue_hos;
+        if (extracted.speeding != null)                   upd.speeding = extracted.speeding;
+        if (extracted.cellphone_usage != null)            upd.cellphone_usage = extracted.cellphone_usage;
+        if (extracted.safety_belt_compliance != null)     upd.safety_belt_compliance = extracted.safety_belt_compliance;
+        if (extracted.driver_behaviour_composite != null) upd.driver_behaviour_composite = extracted.driver_behaviour_composite;
+        if (extracted.distance_index != null)             upd.distance_index = extracted.distance_index;
+        if (extracted.device_integrity != null)           upd.device_integrity = extracted.device_integrity;
+        if (extracted.time_on_road != null)               upd.time_on_road = extracted.time_on_road;
+        if (extracted.night_driving_ratio != null)        upd.night_driving_ratio = extracted.night_driving_ratio;
+        return upd;
+      });
+    } catch (err) {
+      setQExtractError("Questionnaire extraction failed: " + (err.message || String(err)));
+    } finally {
+      setQExtracting(false);
+    }
+  }, []);
+
+  // ── Claims History extraction ───────────────────────────────────────────────
+  const CLAIMS_EXTRACTION_PROMPT = `You are extracting data from a South African fleet insurance claims history / loss run report.
+Return ONLY a single valid JSON object — no preamble, no markdown fences.
+
+{
+  "policy_number": string or null,
+  "insured_name": string or null,
+  "period_full_label": string (e.g. "1/02/2023 to 31/01/2026") or null,
+  "period_full_prem": number or null,
+  "period_full_claims": number or null,
+  "period_full_lr": number or null,
+  "period_year1_label": string or null,
+  "period_year1_prem": number or null,
+  "period_year1_claims": number or null,
+  "period_year1_lr": number or null,
+  "period_year2_label": string or null,
+  "period_year2_prem": number or null,
+  "period_year2_claims": number or null,
+  "period_year2_lr": number or null,
+  "period_year3_label": string or null,
+  "period_year3_prem": number or null,
+  "period_year3_claims": number or null,
+  "period_year3_lr": number or null,
+  "total_claims_count": number or null,
+  "total_incurred": number or null,
+  "largest_single_claim": number or null,
+  "dominant_loss_types": [string] (e.g. ["Water Damage","Fire damage","Hijacking"]) or null,
+  "dominant_commodities": [string] (e.g. ["Foodstuffs","Grains/wheat/maize"]) or null,
+  "open_claims_count": number or null,
+  "open_claims_estimate": number or null,
+  "recommended_lr_for_rating": number (use the 3-year/full-period loss ratio as the primary figure for rating) or null,
+  "extraction_notes": string
+}`;
+
+  const processClaimsHistory = useCallback(async (file) => {
+    if (!file) return;
+    setClaimsExtracting(true);
+    setClaimsExtractError(null);
+    try {
+      const b64 = await fileToBase64(file);
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 3000,
+          system: "You are a data extraction assistant. You MUST respond with valid JSON only. No preamble, no explanation, no markdown fences.",
+          messages: [{ role: "user", content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+            { type: "text", text: CLAIMS_EXTRACTION_PROMPT },
+          ]}],
+        }),
+      });
+      const data = await response.json();
+      let raw = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (fenceMatch) raw = fenceMatch[1];
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("No JSON found in claims extraction response");
+      const extracted = JSON.parse(jsonMatch[0]);
+      setClaimsExtractionData(extracted);
+
+      // Auto-populate loss_ratio_pct into sharedFleetInfo using 3-year figure
+      if (extracted.recommended_lr_for_rating != null) {
+        setSharedFleetInfo(prev => ({
+          ...(prev || {}),
+          loss_ratio_pct: extracted.recommended_lr_for_rating,
+          claims_history: (extracted.recommended_lr_for_rating != null && extracted.recommended_lr_for_rating > 0) ? "one_claim" : "clean",
+        }));
+      }
+    } catch (err) {
+      setClaimsExtractError("Claims history extraction failed: " + (err.message || String(err)));
+    } finally {
+      setClaimsExtracting(false);
+    }
+  }, []);
   const [fileName, setFileName] = useState(null);
   const [extracted, setExtracted] = useState(null);
   const [result, setResult] = useState(null);
@@ -3250,7 +3509,7 @@ export default function TelematixRater() {
           </h1>
           {/* pipeline-v3 */}
           <p style={{ color: "#5C6570", fontSize: "0.95rem", marginTop: "8px", marginBottom: 0 }}>
-            One pipeline: Intake → Risk Scoring → Pricing, branching by asset class. Capture fleet details once in Fleet Information to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
+            One pipeline: Intake → Risk Scoring (Telematics + SQ) → Pricing, branching by asset class. Capture fleet details once in Fleet Details to carry through every step. Extraction and scoring always run separately — the rating is never guessed by the model.
           </p>
         </div>
 
@@ -3260,7 +3519,92 @@ export default function TelematixRater() {
           onAdd={addDocTrayItem}
           onRemove={removeDocTrayItem}
           onTagChange={tagDocTrayItem}
+          onExtract={extractDocTrayFile}
         />
+
+        {/* ── Questionnaire extraction status banner ── */}
+        {(qExtracting || qExtractError || questionnaireData) && (
+          <div style={{
+            marginBottom: "12px", borderRadius: "6px", padding: "12px 16px", fontSize: "0.83rem",
+            background: qExtractError ? "#FDECEA" : qExtracting ? "#EBE8DF" : "#EBF5EE",
+            border: `1px solid ${qExtractError ? "#B23A2E40" : qExtracting ? "#C8D0DC" : "#1E9E5E40"}`,
+            color: qExtractError ? "#B23A2E" : "#14213D",
+            display: "flex", alignItems: "flex-start", gap: "10px",
+          }}>
+            <span style={{ fontSize: "1.1rem" }}>{qExtractError ? "⚠️" : qExtracting ? "🔍" : "✅"}</span>
+            <div style={{ flex: 1 }}>
+              {qExtracting && <strong>Reading Broker Questionnaire — populating all rater fields…</strong>}
+              {qExtractError && <><strong>Questionnaire extraction failed</strong> — {qExtractError}</>}
+              {questionnaireData && !qExtracting && (
+                <>
+                  <strong>Broker Questionnaire extracted</strong>
+                  {" — "}fleet fields, {[
+                    questionnaireData.fatigue_hos != null && "telematics scores",
+                    (questionnaireData.driving_hour_policy != null) && "static questionnaire",
+                    questionnaireData.loss_ratio_pct != null && `LR ${questionnaireData.loss_ratio_pct}%`,
+                    questionnaireData.load_limit_per_vehicle != null && "GIT inputs",
+                  ].filter(Boolean).join(", ") || "basic fields"} populated.
+                  {questionnaireData.telematics_provenance && (
+                    <span style={{ marginLeft: "10px", fontSize: "0.78rem", background: "#14213D15", padding: "2px 7px", borderRadius: "10px", fontWeight: 600 }}>
+                      Provenance: {questionnaireData.telematics_provenance.replace(/_/g, " ")}
+                    </span>
+                  )}
+                  {questionnaireData.extraction_notes && (
+                    <div style={{ marginTop: "4px", fontSize: "0.78rem", color: "#5C6570" }}>
+                      Note: {questionnaireData.extraction_notes}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Claims history extraction status banner ── */}
+        {(claimsExtracting || claimsExtractError || claimsExtractionData) && (
+          <div style={{
+            marginBottom: "12px", borderRadius: "6px", padding: "12px 16px", fontSize: "0.83rem",
+            background: claimsExtractError ? "#FDECEA" : claimsExtracting ? "#EBE8DF" : "#FFF8EC",
+            border: `1px solid ${claimsExtractError ? "#B23A2E40" : claimsExtracting ? "#C8D0DC" : "#B4530940"}`,
+            color: claimsExtractError ? "#B23A2E" : "#14213D",
+            display: "flex", alignItems: "flex-start", gap: "10px",
+          }}>
+            <span style={{ fontSize: "1.1rem" }}>{claimsExtractError ? "⚠️" : claimsExtracting ? "🔍" : "📊"}</span>
+            <div style={{ flex: 1 }}>
+              {claimsExtracting && <strong>Reading claims history — extracting loss ratios…</strong>}
+              {claimsExtractError && <><strong>Claims extraction failed</strong> — {claimsExtractError}</>}
+              {claimsExtractionData && !claimsExtracting && (
+                <>
+                  <strong>Claims history extracted</strong>
+                  {" — "}3-year LR: <strong>{claimsExtractionData.period_full_lr != null ? `${claimsExtractionData.period_full_lr}%` : "—"}</strong>
+                  {" · "}Latest year: <strong>{claimsExtractionData.period_year1_lr != null ? `${claimsExtractionData.period_year1_lr}%` : "—"}</strong>
+                  {" · "}Total incurred: <strong>{claimsExtractionData.total_incurred != null ? `R${claimsExtractionData.total_incurred.toLocaleString("en-ZA")}` : "—"}</strong>
+                  {claimsExtractionData.open_claims_count > 0 && (
+                    <span style={{ marginLeft: "10px", fontSize: "0.78rem", background: "#B4530915", color: "#B45309", padding: "2px 7px", borderRadius: "10px", fontWeight: 600 }}>
+                      {claimsExtractionData.open_claims_count} open claim(s) — estimate R{(claimsExtractionData.open_claims_estimate || 0).toLocaleString("en-ZA")}
+                    </span>
+                  )}
+                  {claimsExtractionData.dominant_loss_types?.length > 0 && (
+                    <div style={{ marginTop: "4px", fontSize: "0.78rem", color: "#5C6570" }}>
+                      Dominant perils: {claimsExtractionData.dominant_loss_types.join(", ")}
+                      {claimsExtractionData.dominant_commodities?.length > 0 && ` · Commodities: ${claimsExtractionData.dominant_commodities.join(", ")}`}
+                    </div>
+                  )}
+                  <div style={{ marginTop: "4px", fontSize: "0.78rem", color: "#B45309", fontWeight: 600 }}>
+                    Rating LR applied: {claimsExtractionData.recommended_lr_for_rating}% → {
+                      claimsExtractionData.recommended_lr_for_rating <= 60 ? "+5% loading" :
+                      claimsExtractionData.recommended_lr_for_rating <= 70 ? "+10% loading" :
+                      claimsExtractionData.recommended_lr_for_rating <= 80 ? "+15% loading" :
+                      claimsExtractionData.recommended_lr_for_rating <= 85 ? "+20% loading" :
+                      claimsExtractionData.recommended_lr_for_rating <= 90 ? "+25% loading" : "+30% loading"
+                    } on HCV motor
+                    {claimsExtractionData.recommended_lr_for_rating > 65 && " · GIT referral triggered (LR > 65%)"}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* ── 3-Stage pipeline progress bar ── */}
         <div style={{ display: "flex", alignItems: "center", marginBottom: "20px", borderRadius: "6px", overflow: "hidden", border: "1px solid #C8D0DC" }}>
@@ -3286,7 +3630,7 @@ export default function TelematixRater() {
               fontSize: "0.88rem", borderRight: "1px solid #C8D0DC",
             }}
           >
-            2 · Risk Scoring
+            2 · Risk Scoring (Telematics + SQ)
           </div>
           <div
             onClick={() => setMode("multi_cohort")}
@@ -3298,7 +3642,7 @@ export default function TelematixRater() {
               fontSize: "0.88rem",
             }}
           >
-            3 · Pricing
+            3 · Premium & Quote
           </div>
         </div>
 
@@ -3308,33 +3652,42 @@ export default function TelematixRater() {
             <>
               <button className="tx-btn" onClick={() => setMode("fleet_info")}
                 style={{ ...tabBtnStyle, background: mode === "fleet_info" ? "#14213D" : "transparent", color: mode === "fleet_info" ? "#FAF7F0" : "#14213D" }}>
-                Fleet Information
+                Fleet Details
               </button>
-              <button className="tx-btn" onClick={() => setMode("hcv")}
-                style={{ ...tabBtnStyle, background: mode === "hcv" ? "#14213D" : "transparent", color: mode === "hcv" ? "#FAF7F0" : "#14213D" }}>
-                Analyse Existing Policy
+              <button className="tx-btn" onClick={() => {
+                  setMode("hcv");
+                  if (pendingPolicyFile) {
+                    processFile(pendingPolicyFile);
+                    setPendingPolicyFile(null);
+                  }
+                }}
+                style={{ ...tabBtnStyle, background: mode === "hcv" ? "#14213D" : "transparent", color: mode === "hcv" ? "#FAF7F0" : "#14213D", position: "relative" }}>
+                Renewal Analysis
+                {pendingPolicyFile && (
+                  <span style={{ position: "absolute", top: "-4px", right: "-4px", width: "8px", height: "8px", background: "#1E9E5E", borderRadius: "50%", border: "1.5px solid #FAF7F0" }} />
+                )}
               </button>
             </>
           )}
           {mode === "risk_scoring" && (
             <button className="tx-btn" onClick={() => setMode("risk_scoring")}
               style={{ ...tabBtnStyle, background: "#14213D", color: "#FAF7F0" }}>
-              HCV Risk Score
+              HCV Score & Profile
             </button>
           )}
           {(mode === "multi_cohort" || mode === "hcv_rating" || mode === "git") && (
             <>
               <button className="tx-btn" onClick={() => setMode("multi_cohort")}
                 style={{ ...tabBtnStyle, background: mode === "multi_cohort" ? "#14213D" : "transparent", color: mode === "multi_cohort" ? "#FAF7F0" : "#14213D" }}>
-                Multi-Cohort
+                Fleet Pricing Summary
               </button>
               <button className="tx-btn" onClick={() => setMode("hcv_rating")}
                 style={{ ...tabBtnStyle, background: mode === "hcv_rating" ? "#14213D" : "transparent", color: mode === "hcv_rating" ? "#FAF7F0" : "#14213D" }}>
-                HCV Rating
+                HCV Motor Rate
               </button>
               <button className="tx-btn" onClick={() => setMode("git")}
                 style={{ ...tabBtnStyle, background: mode === "git" ? "#14213D" : "transparent", color: mode === "git" ? "#FAF7F0" : "#14213D" }}>
-                GIT Quoting
+                GIT Cargo Quote
               </button>
             </>
           )}
@@ -3343,67 +3696,40 @@ export default function TelematixRater() {
         {mode === "risk_scoring" ? (
           <RiskScoringView sharedFleetInfo={sharedFleetInfo} onProceedToPricing={() => setMode("multi_cohort")} />
         ) : mode === "multi_cohort" ? (
-          <MultiCohortView sharedFleetInfo={sharedFleetInfo} />
+          <MultiCohortView sharedFleetInfo={sharedFleetInfo} claimsExtractionData={claimsExtractionData} />
         ) : mode === "git" ? (
           <GitQuotingView sharedFleetInfo={sharedFleetInfo} />
         ) : mode === "hcv_rating" ? (
           <HcvRatingView sharedFleetInfo={sharedFleetInfo} />
         ) : mode === "fleet_info" ? (
-          <FleetInformationView sharedFleetInfo={sharedFleetInfo} onSave={(info) => { setSharedFleetInfo(info); setMode("risk_scoring"); }} />
+          <FleetInformationView
+            sharedFleetInfo={sharedFleetInfo}
+            pendingExtractionFile={pendingFleetFile}
+            onExtractionConsumed={() => setPendingFleetFile(null)}
+            onSave={(info) => { setSharedFleetInfo(info); }}
+            onProceed={() => setMode("risk_scoring")}
+          />
         ) : (
           <>
-        {/* Upload zone */}
-        {status === "idle" || status === "error" ? (
-          <div
-            className="tx-upload-zone"
-            role="button"
-            tabIndex={0}
-            onClick={() => inputRef.current?.click()}
-            onKeyDown={(e) => e.key === "Enter" && inputRef.current?.click()}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={onDrop}
-            style={{
-              border: `2px dashed ${dragOver ? "#B5762A" : "#14213D"}`,
-              borderRadius: "8px",
-              padding: "56px 24px",
-              textAlign: "center",
-              cursor: "pointer",
-              background: dragOver ? "rgba(181,118,42,0.06)" : "transparent",
-              transition: "all 0.15s ease",
-            }}
-          >
-            <div style={{ fontSize: "2rem", marginBottom: "10px" }}>📄</div>
-            <div style={{ fontWeight: 600, fontSize: "1.05rem" }}>
-              Drop a PDF here, or click to choose one
+        {/* Idle state — guide user to Document Tray */}
+        {status === "idle" && (
+          <div style={{
+            border: "1.5px dashed #C8D0DC", borderRadius: "8px",
+            padding: "28px 24px", textAlign: "center", color: "#5C6570",
+            fontSize: "0.85rem", lineHeight: 1.6,
+          }}>
+            <div style={{ fontSize: "1.5rem", marginBottom: "8px" }}>📁</div>
+            <div style={{ fontWeight: 600, color: "#14213D", marginBottom: "4px" }}>
+              Add a policy schedule or RMS/iCab report via the Document Tray above
             </div>
-            <div style={{ color: "#5C6570", fontSize: "0.85rem", marginTop: "6px" }}>
-              RMS transporter risk report or insurer GIT policy schedule
-            </div>
-            <input
-              ref={inputRef}
-              type="file"
-              accept="application/pdf"
-              style={{ display: "none" }}
-              onChange={(e) => processFile(e.target.files?.[0])}
-            />
-            {status === "error" && (
-              <div
-                style={{
-                  marginTop: "20px",
-                  color: "#B23A2E",
-                  fontSize: "0.9rem",
-                  fontFamily: "'IBM Plex Mono', monospace",
-                }}
-              >
-                {errorMsg}
-              </div>
-            )}
+            Tag it as <strong>Policy Schedule</strong>, <strong>RMS / iCab Risk Assessment</strong>, or <strong>Forte FLOW</strong>, then click <strong>Extract →</strong>
           </div>
-        ) : null}
+        )}
+        {status === "error" && (
+          <div style={{ color: "#B23A2E", fontSize: "0.9rem", padding: "16px", fontFamily: "'IBM Plex Mono', monospace", background: "#FDECEA", borderRadius: "6px" }}>
+            {errorMsg}
+          </div>
+        )}
 
         {/* Loading state */}
         {(status === "reading" || status === "extracting") && (
@@ -3568,7 +3894,7 @@ function GitQuotingView({ sharedFleetInfo }) {
           letterSpacing: "0.08em",
         }}
       >
-        GIT Quoting
+        GIT Cargo Quote
       </div>
 
       <div style={{ marginBottom: "20px" }}>

@@ -604,7 +604,7 @@ Rules:
 - extraction_notes: describe what you found, any outlier months, projected months, and data quality issues.
 - IMPORTANT: you MUST compute per-year loss_ratio_pct values.`;
 
-export default function MultiCohortView({ sharedFleetInfo }) {
+export default function MultiCohortView({ sharedFleetInfo, claimsExtractionData }) {
   const shared = sharedFleetInfo || {};
   const [cohorts, setCohorts] = useState(() => [makeCohort(0, shared)]);
 
@@ -1749,8 +1749,8 @@ export default function MultiCohortView({ sharedFleetInfo }) {
         );
       })}
 
-      {/* Claims History Upload */}
-      <div style={{ marginTop: "24px", padding: "16px 18px", background: "#F5F7FA", borderRadius: "8px", border: "1px solid #E0E6EE" }}>
+      {/* Claims History Upload — hidden when claims already extracted via Document Tray */}
+      {!claimsExtractionData && <div style={{ marginTop: "24px", padding: "16px 18px", background: "#F5F7FA", borderRadius: "8px", border: "1px solid #E0E6EE" }}>
         <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#14213D", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "10px" }}>Claims History Upload</div>
         <div style={{ fontSize: "0.82rem", color: "#5C6570", marginBottom: "12px" }}>
           Upload a 3-year claims history (PDF or Excel). Loss ratios are extracted per year, allocated to cohorts, and the 65% referral gate applies automatically.
@@ -1837,7 +1837,7 @@ export default function MultiCohortView({ sharedFleetInfo }) {
             </button>
           </div>
         )}
-      </div>
+      </div>}
 
       {/* Shared loadings summary */}
       <div style={{ marginTop: "24px" }}>
