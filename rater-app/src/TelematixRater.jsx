@@ -3450,6 +3450,48 @@ Return ONLY a single valid JSON object — no preamble, no markdown fences.
     if (!file) return;
     setTelematicsExtracting(true);
     setTelematicsExtractMsg(null);
+
+    const TELEMATICS_SCORING_PROMPT = `You are extracting driver behaviour scores from a South African fleet telematics risk report (RMS/LibroAssist/iCab/Forte FLOW or similar).
+
+Your job is to populate the 9 behavioural risk scores (0-100 scale) for an insurance underwriting tool. Scores may appear as printed numbers, bar charts, gauges, dials, or colour-coded risk bands.
+
+CRITICAL INSTRUCTION: You MUST read values from graphs, charts, bars, and gauges visually — do not return null simply because a value appears on a graph rather than in a printed table. Read the bar height against the axis, the gauge needle position, the dial reading. A reasonable visual estimate is required and is far better than null. Flag graph-read values in low_confidence_fields.
+
+Score definitions (0 = no risk, 100 = maximum risk):
+- fatigue_hos: hours-of-service or fatigue violations
+- speeding: speed policy breach rate
+- cellphone_usage: mobile phone use while driving
+- safety_belt_compliance: seatbelt non-compliance
+- driver_behaviour_composite: overall composite driver score or aggregate risk score
+- distance_index: excessive distance / km-related risk
+- device_integrity: GPS/telematics device tampering or coverage gaps
+- time_on_road: excessive continuous driving time
+- night_driving_ratio: driving in high-risk hours 22h00-04h00
+
+Use the LATEST month's data where multiple months are shown. If the report shows a trend of several months, also note the trend direction.
+
+Return ONLY valid JSON, no markdown fences:
+{
+  "transporter_name": string or null,
+  "report_date": string or null,
+  "vehicle_count": number or null,
+  "avg_km_per_vehicle_month": number or null,
+  "fatigue_hos": number (0-100) or null,
+  "speeding": number (0-100) or null,
+  "cellphone_usage": number (0-100) or null,
+  "safety_belt_compliance": number (0-100) or null,
+  "driver_behaviour_composite": number (0-100) or null,
+  "distance_index": number (0-100) or null,
+  "device_integrity": number (0-100) or null,
+  "time_on_road": number (0-100) or null,
+  "night_driving_ratio": number (0-100) or null,
+  "device_concealment_events_per_month": number or null,
+  "trend_direction": one of ["improving_strongly","improving_slightly","stable","deteriorating_slightly","deteriorating_3plus_months"] or null,
+  "combined_score_latest": number (0-100) or null,
+  "low_confidence_fields": [list of field names read from graphs rather than printed tables],
+  "extraction_notes": string
+}`;
+
     try {
       const b64 = await fileToBase64(file);
       const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
@@ -3457,54 +3499,56 @@ Return ONLY a single valid JSON object — no preamble, no markdown fences.
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-6",
-          max_tokens: 8000,
+          max_tokens: 4000,
           messages: [{ role: "user", content: [
             { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-            { type: "text", text: EXTRACTION_PROMPT },
+            { type: "text", text: TELEMATICS_SCORING_PROMPT },
           ]}],
         }),
       });
       const data = await response.json();
       let raw = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
       if (raw.startsWith("```")) raw = raw.replace(/^```(json)?/, "").replace(/```$/, "").trim();
-      const json = JSON.parse(raw);
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error("No JSON in response");
+      const json = JSON.parse(m[0]);
 
-      // Pull per-score fields from the latest month's data
-      const months = json.monthly_data || [];
-      const latest = months.length > 0 ? months[months.length - 1] : {};
-      const fs = json.fleet_summary || {};
-
-      // Map what the extraction prompt returns into riskScoringForm fields
+      // Map all 9 scores from new prompt shape into riskScoringForm
       setRiskScoringForm(prev => {
         const upd = { ...prev };
-        if (latest.fatigue_hos != null)     upd.fatigue_hos     = Number(latest.fatigue_hos);
-        if (latest.speeding != null)        upd.speeding        = Number(latest.speeding);
-        if (latest.distance_index != null)  upd.distance_index  = Number(latest.distance_index);
-        // combined score from fleet summary → use as driver_behaviour_composite if no individual score
-        if (fs.combined_risk_score_latest != null && upd.driver_behaviour_composite === 0)
-          upd.driver_behaviour_composite = Number(fs.combined_risk_score_latest);
-        if (fs.avg_km_per_vehicle_month != null)
-          upd.avg_km_per_vehicle_month = Number(fs.avg_km_per_vehicle_month);
+        const SCORE_FIELDS = [
+          "fatigue_hos","speeding","cellphone_usage","safety_belt_compliance",
+          "driver_behaviour_composite","distance_index","device_integrity",
+          "time_on_road","night_driving_ratio","device_concealment_events_per_month",
+          "avg_km_per_vehicle_month",
+        ];
+        SCORE_FIELDS.forEach(k => { if (json[k] != null) upd[k] = Number(json[k]); });
+        if (json.trend_direction) upd.trend = json.trend_direction;
+        // combined score → driver_behaviour_composite fallback
+        if (json.combined_score_latest != null && upd.driver_behaviour_composite === 0)
+          upd.driver_behaviour_composite = Number(json.combined_score_latest);
         return upd;
       });
 
-      // Also push fleet name / vehicle count into sharedFleetInfo if present
-      if (json.transporter_or_insured_name) {
+      // Push fleet name / vehicle count into sharedFleetInfo
+      if (json.transporter_name || json.vehicle_count) {
         setSharedFleetInfo(prev => ({
           ...(prev || {}),
-          fleet_name: prev?.fleet_name || json.transporter_or_insured_name,
-          vehicle_count: prev?.vehicle_count || fs.avg_vehicles || prev?.vehicle_count,
+          fleet_name: prev?.fleet_name || json.transporter_name || prev?.fleet_name,
+          vehicle_count: (prev?.vehicle_count && prev.vehicle_count > 0) ? prev.vehicle_count : (json.vehicle_count || prev?.vehicle_count),
         }));
       }
 
-      const scoreCount = [latest.fatigue_hos, latest.speeding, latest.distance_index]
-        .filter(v => v != null).length;
+      const filled = ["fatigue_hos","speeding","cellphone_usage","safety_belt_compliance",
+        "driver_behaviour_composite","distance_index","device_integrity",
+        "time_on_road","night_driving_ratio"].filter(k => json[k] != null);
+      const graphRead = (json.low_confidence_fields || []).length;
+
       setTelematicsExtractMsg(
-        scoreCount > 0
-          ? `✓ Extracted ${scoreCount} telematics score${scoreCount > 1 ? "s" : ""} from report — Tab 2 updated. Fill in remaining scores manually.`
-          : `⚠ Report extracted but no individual behaviour scores found (graphs only, no printed numbers). Enter scores manually in Tab 2.`
+        filled.length > 0
+          ? `✓ Extracted ${filled.length}/9 behaviour scores${graphRead > 0 ? ` (${graphRead} read from graphs — review in Tab 2)` : ""} — Tab 2 updated.`
+          : `⚠ No behaviour scores could be extracted. Check the report format and enter scores manually in Tab 2.`
       );
-      // Auto-navigate to Tab 2 so the user sees the populated fields
       setMode("risk_scoring");
     } catch (err) {
       setTelematicsExtractMsg("Extraction failed: " + (err.message || String(err)));
