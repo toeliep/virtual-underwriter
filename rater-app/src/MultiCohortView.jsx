@@ -170,12 +170,30 @@ function priceVehicle(vehicle, qualFactor) {
   };
 }
 
+// Frans-confirmed HCV claims experience loading bands (9 Jul 2026)
+// 0% loading when no history (opt-in only — no penalty for unknown)
+const HCV_CLAIMS_BANDS = [
+  { min: 0,  max: 60,       loading: 0.05 },
+  { min: 61, max: 70,       loading: 0.10 },
+  { min: 71, max: 85,       loading: 0.20 },
+  { min: 86, max: 90,       loading: 0.25 },
+  { min: 91, max: Infinity, loading: 0.30 },
+];
+function hcvClaimsLoading(lr) {
+  if (lr == null) return 0;
+  const band = HCV_CLAIMS_BANDS.find(b => lr >= b.min && lr <= b.max) || HCV_CLAIMS_BANDS[HCV_CLAIMS_BANDS.length - 1];
+  return band.loading;
+}
+
 function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
-  // Loss ratio gate
+  // Loss ratio gate — REFER if > 65% and no approver override
   const lr = cohort.hcv_loss_ratio_pct;
   if (lr != null && lr > 65 && !cohort.hcv_loss_ratio_override_approver) {
     return { ...cohort, status: "REFER", referral_reason: `Loss ratio ${lr.toFixed(1)}% exceeds 65% threshold. Enter approver name to override.`, cohort_monthly: null, cohort_annual: null };
   }
+
+  // Claims experience loading (additive on base premium, applied after qual factor)
+  const claimsLoad = hcvClaimsLoading(lr);
 
   const ds = cohort.hcv_data_source || "none";
   let qual = HCV_QUALIFIER[ds] || HCV_QUALIFIER.none;
@@ -205,16 +223,18 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
   if (hcvVehicles.length > 0) {
     // PER-VEHICLE PRICING
     const pricedVehicles = hcvVehicles.map(v => priceVehicle(v, qual.factor));
-    const totalAnnual = pricedVehicles.reduce((s, v) => s + v.annual, 0);
+    const baseAnnual = pricedVehicles.reduce((s, v) => s + v.annual, 0);
+    const totalAnnual = baseAnnual * (1 + claimsLoad);
     const totalSI = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0), 0);
     const minApplied = totalAnnual < HCV_MIN_ANNUAL_PREMIUM;
     const finalAnnual = minApplied ? HCV_MIN_ANNUAL_PREMIUM : totalAnnual;
 
-    const baseAnnual = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0) * HCV_BASE_RATE, 0);
+    const baseAnnualNoLoad = pricedVehicles.reduce((s, v) => s + (v.insured_value || 0) * HCV_BASE_RATE, 0);
     return {
       ...cohort,
       status: "QUOTABLE",
       hcv_qualifier: qual,
+      hcv_claims_loading: claimsLoad,
       total_sum_insured: totalSI,
       vehicle_count: hcvVehicles.length,
       priced_vehicles: pricedVehicles,
@@ -222,7 +242,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
       cohort_annual: Math.round(finalAnnual * 100) / 100,
       min_premium_applied: minApplied,
       pricing_mode: "per_vehicle",
-      multiplier: baseAnnual > 0 ? Math.round((totalAnnual / baseAnnual) * 100) / 100 : qual.factor,
+      multiplier: baseAnnualNoLoad > 0 ? Math.round((totalAnnual / baseAnnualNoLoad) * 100) / 100 : qual.factor,
     };
   }
 
@@ -240,7 +260,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
   const ageBand = classifyHcvAgeBandMC(cohort.hcv_year_model);
   const ageLoad = HCV_AGE_BAND_LOADINGS[ageBand] ?? 0;
 
-  let annual = sumInsured * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qual.factor;
+  let annual = sumInsured * HCV_BASE_RATE * (1 + mfrLoad) * (1 + ageLoad) * qual.factor * (1 + claimsLoad);
   let minApplied = false;
   if (annual < HCV_MIN_ANNUAL_PREMIUM) { annual = HCV_MIN_ANNUAL_PREMIUM; minApplied = true; }
 
@@ -248,6 +268,7 @@ function priceHcvCohort(cohort, sharedInfo, sharedFleetInfo, riskScoreResult) {
     ...cohort,
     status: "QUOTABLE",
     hcv_qualifier: qual,
+    hcv_claims_loading: claimsLoad,
     hcv_age_band: ageBand,
     hcv_manufacturer_loading: mfrLoad,
     hcv_age_loading: ageLoad,
@@ -1643,8 +1664,14 @@ export default function MultiCohortView({ sharedFleetInfo, claimsExtractionData,
                     ) : isHcv ? (
                       <>
                         <div>Base rate: {(HCV_BASE_RATE * 100).toFixed(1)}% p.a. · Data-source qualifier: {cohort.hcv_qualifier?.factor?.toFixed(2)}× ({cohort.hcv_qualifier?.label})</div>
-                        {cohort.hcv_loss_ratio_override_approver && (
-                          <div style={{ color: "#B5762A" }}>Loss ratio override: approved by {cohort.hcv_loss_ratio_override_approver}</div>
+                        {cohort.hcv_claims_loading > 0 && (
+                          <div style={{ color: "#B5762A", marginTop: "2px" }}>
+                            Claims experience loading: +{(cohort.hcv_claims_loading * 100).toFixed(0)}% (LR {cohort.hcv_loss_ratio_pct?.toFixed(1)}%)
+                            {cohort.hcv_loss_ratio_override_approver && ` · Override: ${cohort.hcv_loss_ratio_override_approver}`}
+                          </div>
+                        )}
+                        {cohort.hcv_claims_loading === 0 && cohort.hcv_loss_ratio_pct != null && (
+                          <div style={{ color: "#1E9E5E", marginTop: "2px" }}>Claims experience: LR {cohort.hcv_loss_ratio_pct?.toFixed(1)}% — no additional loading (≤60%)</div>
                         )}
                         {cohort.pricing_mode === "per_vehicle" && cohort.priced_vehicles?.length > 0 ? (
                           <div style={{ marginTop: "8px", overflowX: "auto" }}>
