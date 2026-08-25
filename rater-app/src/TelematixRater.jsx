@@ -3182,6 +3182,8 @@ export default function TelematixRater() {
   const [qExtractError,        setQExtractError]        = useState(null);
   const [claimsExtracting,     setClaimsExtracting]     = useState(false);
   const [claimsExtractError,   setClaimsExtractError]   = useState(null);
+  const [telematicsExtracting, setTelematicsExtracting] = useState(false);
+  const [telematicsExtractMsg, setTelematicsExtractMsg] = useState(null); // success or error string
 
   const extractDocTrayFile = (file, tag) => {
     if (tag === "fleet_schedule") {
@@ -3190,7 +3192,7 @@ export default function TelematixRater() {
     } else if (tag === "policy_schedule" || tag === "needs_analysis") {
       setPendingPolicyFile(file);
     } else if (tag === "telematics_report" || tag === "rms_icab_report" || tag === "forte_report") {
-      setPendingTelematicsFile(file);
+      processTelematicsReport(file);
     } else if (tag === "claims_history") {
       processClaimsHistory(file);
     } else if (tag === "broker_questionnaire") {
@@ -3440,6 +3442,77 @@ Return ONLY a single valid JSON object — no preamble, no markdown fences.
       setClaimsExtracting(false);
     }
   }, []);
+
+  // ── Telematics Report extraction → Tab 2 ──────────────────────────────────
+  // Runs the existing RMS/iCab/Forte extraction pipeline and pushes whatever
+  // individual scores it finds into riskScoringForm so Tab 2 pre-populates.
+  const processTelematicsReport = useCallback(async (file) => {
+    if (!file) return;
+    setTelematicsExtracting(true);
+    setTelematicsExtractMsg(null);
+    try {
+      const b64 = await fileToBase64(file);
+      const response = await fetch("https://telematix-rater-backend.onrender.com/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 8000,
+          messages: [{ role: "user", content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+            { type: "text", text: EXTRACTION_PROMPT },
+          ]}],
+        }),
+      });
+      const data = await response.json();
+      let raw = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      if (raw.startsWith("```")) raw = raw.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+      const json = JSON.parse(raw);
+
+      // Pull per-score fields from the latest month's data
+      const months = json.monthly_data || [];
+      const latest = months.length > 0 ? months[months.length - 1] : {};
+      const fs = json.fleet_summary || {};
+
+      // Map what the extraction prompt returns into riskScoringForm fields
+      setRiskScoringForm(prev => {
+        const upd = { ...prev };
+        if (latest.fatigue_hos != null)     upd.fatigue_hos     = Number(latest.fatigue_hos);
+        if (latest.speeding != null)        upd.speeding        = Number(latest.speeding);
+        if (latest.distance_index != null)  upd.distance_index  = Number(latest.distance_index);
+        // combined score from fleet summary → use as driver_behaviour_composite if no individual score
+        if (fs.combined_risk_score_latest != null && upd.driver_behaviour_composite === 0)
+          upd.driver_behaviour_composite = Number(fs.combined_risk_score_latest);
+        if (fs.avg_km_per_vehicle_month != null)
+          upd.avg_km_per_vehicle_month = Number(fs.avg_km_per_vehicle_month);
+        return upd;
+      });
+
+      // Also push fleet name / vehicle count into sharedFleetInfo if present
+      if (json.transporter_or_insured_name) {
+        setSharedFleetInfo(prev => ({
+          ...(prev || {}),
+          fleet_name: prev?.fleet_name || json.transporter_or_insured_name,
+          vehicle_count: prev?.vehicle_count || fs.avg_vehicles || prev?.vehicle_count,
+        }));
+      }
+
+      const scoreCount = [latest.fatigue_hos, latest.speeding, latest.distance_index]
+        .filter(v => v != null).length;
+      setTelematicsExtractMsg(
+        scoreCount > 0
+          ? `✓ Extracted ${scoreCount} telematics score${scoreCount > 1 ? "s" : ""} from report — Tab 2 updated. Fill in remaining scores manually.`
+          : `⚠ Report extracted but no individual behaviour scores found (graphs only, no printed numbers). Enter scores manually in Tab 2.`
+      );
+      // Auto-navigate to Tab 2 so the user sees the populated fields
+      setMode("risk_scoring");
+    } catch (err) {
+      setTelematicsExtractMsg("Extraction failed: " + (err.message || String(err)));
+    } finally {
+      setTelematicsExtracting(false);
+    }
+  }, []);
+
   const [fileName, setFileName] = useState(null);
   const [extracted, setExtracted] = useState(null);
   const [result, setResult] = useState(null);
@@ -3621,6 +3694,23 @@ Return ONLY a single valid JSON object — no preamble, no markdown fences.
                   )}
                 </>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Telematics report extraction status banner ── */}
+        {(telematicsExtracting || telematicsExtractMsg) && (
+          <div style={{
+            marginBottom: "12px", borderRadius: "6px", padding: "12px 16px", fontSize: "0.83rem",
+            background: telematicsExtractMsg?.startsWith("⚠") || telematicsExtractMsg?.startsWith("Extraction failed") ? "#FDECEA" : telematicsExtracting ? "#EBE8DF" : "#EBF5EE",
+            border: `1px solid ${telematicsExtractMsg?.startsWith("Extraction failed") ? "#B23A2E40" : telematicsExtracting ? "#C8D0DC" : "#1E9E5E40"}`,
+            color: telematicsExtractMsg?.startsWith("Extraction failed") ? "#B23A2E" : "#14213D",
+            display: "flex", alignItems: "flex-start", gap: "10px",
+          }}>
+            <span style={{ fontSize: "1.1rem" }}>{telematicsExtracting ? "🔍" : telematicsExtractMsg?.startsWith("✓") ? "📡" : "⚠️"}</span>
+            <div>
+              {telematicsExtracting && <strong>Reading Telematics Report — extracting behaviour scores into Tab 2…</strong>}
+              {!telematicsExtracting && telematicsExtractMsg && <span>{telematicsExtractMsg}</span>}
             </div>
           </div>
         )}
